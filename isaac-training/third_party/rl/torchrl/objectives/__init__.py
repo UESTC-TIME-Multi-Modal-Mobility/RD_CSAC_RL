@@ -26,6 +26,7 @@ from .utils import (
     next_state_value,
     SoftUpdate,
     ValueEstimators,
+    group_optimizers,
 )
 
 # from .value import bellman_max, c_val, dv_val, vtrace, GAE, TDLambdaEstimate, TDEstimate

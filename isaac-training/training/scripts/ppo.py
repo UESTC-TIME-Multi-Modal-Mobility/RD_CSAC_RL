@@ -7,7 +7,8 @@ from einops.layers.torch import Rearrange
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
 from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
-
+from model import ViT,ConvNet
+# from torch.cuda.amp import autocast, GradScaler
 
 
 class PPO(TensorDictModuleBase):
@@ -16,16 +17,18 @@ class PPO(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
 
+        # self.scaler = GradScaler()
+        # Feature extractor for LiDAR()
+        # feature_extractor_network = nn.Sequential(
+        #     nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
+        #     nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
+        #     nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+        #     Rearrange("n c w h -> n (c w h)"),
+        #     nn.LazyLinear(128), nn.LayerNorm(128),
+        # ).to(self.device)
         
-        # Feature extractor for LiDAR
-        feature_extractor_network = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
-            Rearrange("n c w h -> n (c w h)"),
-            nn.LazyLinear(128), nn.LayerNorm(128),
-        ).to(self.device)
-        
+        feature_extractor_network = ViT().to(self.device)  # Use ViT as the feature extractor
+        # feature_extractor_network = ConvNet().to(self.device)  # Use ViT as the feature extractor
         # Dynamic obstacle information extractor
         dynamic_obstacle_network = nn.Sequential(
             Rearrange("n c w h -> n (c w h)"),
@@ -94,8 +97,19 @@ class PPO(TensorDictModuleBase):
     def train(self, tensordict):
         # tensordict: (num_env, num_frames, dim), batchsize = num_env * num_frames
         next_tensordict = tensordict["next"]
+        save_path = f"tensordict_step_0.pt"
+        torch.save(next_tensordict, save_path)
+        Warning("next_tensordict: ", next_tensordict)
         with torch.no_grad():
-            next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict) # calculate features for next state value calculation
+            B = next_tensordict.batch_size[0]    
+            batch_size = 64  # 控制每次处理的样本数，视 GPU 显存定   
+            td_list = []
+            for i in range(0, B, batch_size):
+                td_chunk = next_tensordict[i:i+batch_size]
+                out_chunk = torch.vmap(self.feature_extractor)(td_chunk)
+                td_list.append(out_chunk)
+            next_tensordict = torch.cat(td_list, 0)
+            # next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict) # calculate features for next state value calculation
             next_values = self.critic(next_tensordict)["state_value"]
         rewards = tensordict["next", "agents", "reward"] # Reward obtained by state transition
         dones = tensordict["next", "terminated"] # Whether the next states are terminal states
@@ -119,7 +133,8 @@ class PPO(TensorDictModuleBase):
         for epoch in range(self.cfg.training_epoch_num):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
             for minibatch in batch:
-                infos.append(self._update(minibatch))
+                # with autocast():
+                infos.append(self._update(minibatch))       
         infos = torch.stack(infos).to_tensordict()
         
         infos = infos.apply(torch.mean, batch_size=[])
@@ -160,6 +175,7 @@ class PPO(TensorDictModuleBase):
         self.feature_extractor_optim.zero_grad()
         self.actor_optim.zero_grad()
         self.critic_optim.zero_grad()
+        # self.scaler.scale(loss).backward()
         loss.backward()
 
         actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.) # to prevent gradient growing too large
@@ -167,6 +183,11 @@ class PPO(TensorDictModuleBase):
         self.feature_extractor_optim.step()
         self.actor_optim.step()
         self.critic_optim.step()
+
+        # self.scaler.step(self.feature_extractor_optim)
+        # self.scaler.step(self.actor_optim)
+        # self.scaler.step(self.critic_optim)
+        # self.scaler.update()  # Update the scaler after the step
         explained_var = 1 - F.mse_loss(value, ret) / ret.var()
         return TensorDict({
             "actor_loss": actor_loss,

@@ -54,9 +54,14 @@ class MySceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
-        visual_material=sim_utils.MdlFileCfg(
-            mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
-            project_uvw=True,
+        # visual_material=sim_utils.MdlFileCfg(
+        #     # mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
+        #     project_uvw=True,
+        # ),
+        visual_material = sim_utils.PreviewSurfaceCfg(
+            diffusive_color=(0.6, 0.5, 0.4),  # Ground color (RGB)
+            roughness=0.8,  # Roughness (value between 0 and 1)
+            metallic=0.0    # Metallic property (value between 0 and 1)
         ),
         debug_vis=False,
     )

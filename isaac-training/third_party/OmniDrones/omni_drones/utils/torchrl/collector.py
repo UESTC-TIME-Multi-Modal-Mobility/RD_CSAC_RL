@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
+# 这个文件相当于在对 torchrl.collectors.SyncDataCollector 进行了一些修改，实现一些自己想要的功能，值得学习
 import torch
 import time
 from torchrl.collectors import SyncDataCollector as _SyncDataCollector

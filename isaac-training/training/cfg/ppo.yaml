@@ -13,6 +13,30 @@ algo:
     clip_ratio: 0.1
   
   entropy_loss_coefficient: 1e-3 # encourage exploration
-  training_frame_num: 32
+  training_frame_num: 32   #每环境32帧
   training_epoch_num: 4
   num_minibatches: 16 # split into N minibatches
+  buffer_size: 16e4
+  warmup_steps: 500
+  eval_interval: 1000
+
+  # network
+  network:
+    hidden_sizes: [256, 256]
+    activation: relu
+    default_policy_scale: 1.0
+    scale_lb: 0.1
+    device: cuda:0
+
+  # optim
+  optim:
+    utd_ratio: 1.0
+    gamma: 0.99
+    loss_function: l2
+    lr: 3.0e-4
+    weight_decay: 0.0
+    batch_size: 256
+    target_update_polyak: 0.995
+    alpha_init: 1.0
+    adam_eps: 1.0e-8
+  
