@@ -80,8 +80,9 @@ class SAC(TensorDictModuleBase):
             out_keys=[("agents", "action")]  # 直接输出到目标动作范围
         ).to(self.device)
 
-        # SAC 需要两个 Q 网络
+        # SAC 需要两个 Q 网络 - 使用CatTensors来连接feature和action
         self.qvalue1 = TensorDictSequential(
+            CatTensors(["_feature", ("agents", "action")], "_feature_action", del_keys=False),
             TensorDictModule(
                 nn.Sequential(
                     nn.Linear(256 + self.action_dim, 256),  # feature + action
@@ -90,12 +91,13 @@ class SAC(TensorDictModuleBase):
                     nn.ReLU(),
                     nn.Linear(256, 1)
                 ),
-                in_keys=["_feature", ("agents", "action")],
+                in_keys=["_feature_action"],
                 out_keys=["state_action_value_1"]
             )
         ).to(self.device)
 
         self.qvalue2 = TensorDictSequential(
+            CatTensors(["_feature", ("agents", "action")], "_feature_action", del_keys=False),
             TensorDictModule(
                 nn.Sequential(
                     nn.Linear(256 + self.action_dim, 256),
@@ -104,7 +106,7 @@ class SAC(TensorDictModuleBase):
                     nn.ReLU(),
                     nn.Linear(256, 1)
                 ),
-                in_keys=["_feature", ("agents", "action")],
+                in_keys=["_feature_action"],
                 out_keys=["state_action_value_2"]
             )
         ).to(self.device)
@@ -118,6 +120,9 @@ class SAC(TensorDictModuleBase):
         self.log_alpha = nn.Parameter(torch.zeros(1, device=device))
         # 使用detach来避免计算图问题
         self.alpha = self.log_alpha.exp().detach()
+        
+        # SAC参数
+        self.gamma = getattr(cfg, 'gamma', 0.99)  # 折扣因子
 
         # Loss related
         self.critic_loss_fn = nn.HuberLoss(delta=10) # huberloss (L1+L2): https://pytorch.org/docs/stable/generated/torch.nn.HuberLoss.html
@@ -127,7 +132,7 @@ class SAC(TensorDictModuleBase):
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
         self.qvalue1_optim = torch.optim.Adam(self.qvalue1.parameters(), lr=cfg.critic.learning_rate)
         self.qvalue2_optim = torch.optim.Adam(self.qvalue2.parameters(), lr=cfg.critic.learning_rate)
-        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate if hasattr(cfg, 'alpha_learning_rate') else 3e-4)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate if hasattr(cfg, 'alpha_learning_rate') else 1e-7)
 
         # Dummy Input for nn lazymodule
         dummy_input = observation_spec.zero()
@@ -174,7 +179,8 @@ class SAC(TensorDictModuleBase):
         # Q-networks are only used during training
 
         # Cooridnate change: transform local to world
-        actions = (2 * tensordict["agents", "action_normalized"] * self.cfg.actor.action_limit) - self.cfg.actor.action_limit
+        # SAC风格：TanhNormal已经输出合适范围的action
+        actions = tensordict["agents", "action"] * self.cfg.actor.action_limit
         actions_world = vec_to_world(actions, tensordict["agents", "observation", "direction"])
         tensordict["agents", "action"] = actions_world
         return tensordict
@@ -185,10 +191,12 @@ class SAC(TensorDictModuleBase):
         update_steps = getattr(self.cfg, 'update_steps', 1)
         for _ in range(update_steps):
             # Sample from replay buffer
-            batch = replay_buffer.sample(batch_size)
-            info = self._update_sac(batch, tau, alpha)
-            infos.append(info)
-        
+            batch = replay_buffer.sample(batch_size).to(self.device)
+            for epoch in range(self.cfg.training_epoch_num):
+                batch1 = make_batch(batch, self.cfg.num_minibatches)
+                for minibatch in batch1:
+                    info = self._update_sac(minibatch, tau, alpha)
+                    infos.append(info)
         infos = torch.stack(infos).to_tensordict()
         infos = infos.apply(torch.mean, batch_size=[])
         return {k: v.item() for k, v in infos.items()}
@@ -215,46 +223,82 @@ class SAC(TensorDictModuleBase):
             # Get next state features and actions
             next_batch = TensorDict({
                 "agents": batch["next", "agents"]
-            }, batch_size=batch.batch_size)
+            }, batch_size=batch["next"].batch_size, device=self.device)
             next_batch_with_features = self.feature_extractor(next_batch)
             next_actions_td = self.actor(next_batch_with_features)
             next_actions = next_actions_td[("agents", "action")]
-            next_log_probs = next_actions_td.get("sample_log_prob", torch.zeros_like(rewards))
+            next_log_probs = next_actions_td.get("sample_log_prob", torch.zeros(batch.batch_size[0], device=self.device))
+            
+            
+            # 构造Q网络的输入TensorDict
+            next_q_input = TensorDict({
+                "_feature": next_batch_with_features["_feature"],
+                ("agents", "action"): next_actions,
+            }, batch_size=batch.batch_size, device=self.device)
             
             # Compute target Q-values using target networks
-            next_batch_with_features.set(("agents", "action"), next_actions)
-            next_q1 = self.qvalue1_target(next_batch_with_features)["state_action_value_1"]
-            next_q2 = self.qvalue2_target(next_batch_with_features)["state_action_value_2"]
+            next_q1 = self.qvalue1_target(next_q_input)["state_action_value_1"]
+            next_q2 = self.qvalue2_target(next_q_input)["state_action_value_2"]
             next_q = torch.min(next_q1, next_q2)
             
-            target_q = rewards + self.cfg.gamma * (1 - dones.float()) * (next_q - alpha * next_log_probs.unsqueeze(-1))
+            # 处理log_probs维度
+            if next_log_probs.dim() == 1:
+                next_log_probs = next_log_probs.unsqueeze(-1)  # [batch, 1]
+            
+            target_q = rewards + self.gamma * (1 - dones.float()) * (next_q - alpha * next_log_probs)
         
-        # Current Q-values
-        batch_with_features.set(("agents", "action"), batch[("agents", "action")])
-        current_q1 = self.qvalue1(batch_with_features)["state_action_value_1"]
-        current_q2 = self.qvalue2(batch_with_features)["state_action_value_2"]
+        # Current Q-values - 分别计算避免共享计算图
+        current_actions_batch = batch[("agents", "action")]
         
-        # Q-function losses
-        q1_loss = F.mse_loss(current_q1, target_q)
-        q2_loss = F.mse_loss(current_q2, target_q)
+        # 为Q1计算单独的输入
+        current_q1_input = TensorDict({
+            "_feature": batch_with_features["_feature"].detach().clone(),  # detach并clone避免共享
+            ("agents", "action"): current_actions_batch.detach().clone(),
+        }, batch_size=batch.batch_size, device=self.device)
         
-        # Update Q-functions
+        # 为Q2计算单独的输入
+        current_q2_input = TensorDict({
+            "_feature": batch_with_features["_feature"].detach().clone(),
+            ("agents", "action"): current_actions_batch.detach().clone(),
+        }, batch_size=batch.batch_size, device=self.device)
+        
+        current_q1 = self.qvalue1(current_q1_input)["state_action_value_1"]
+        current_q2 = self.qvalue2(current_q2_input)["state_action_value_2"]
+        
+        # Q-function losses - 分别计算
+        target_q_detached = target_q.detach()
+        q1_loss = F.mse_loss(current_q1, target_q_detached)
+        q2_loss = F.mse_loss(current_q2, target_q_detached)
+        
+        # Update Q-functions separately
         self.qvalue1_optim.zero_grad()
-        q1_loss.backward(retain_graph=True)
+        q1_loss.backward()
         self.qvalue1_optim.step()
         
         self.qvalue2_optim.zero_grad()
         q2_loss.backward()
         self.qvalue2_optim.step()
         
-        # Update actor
-        batch_with_features.set(("agents", "action"), current_actions)
-        q1_new = self.qvalue1(batch_with_features)["state_action_value_1"]
-        q2_new = self.qvalue2(batch_with_features)["state_action_value_2"]
+        # Update actor - 重新前向传播获得新的actions
+        fresh_batch_with_features = self.feature_extractor(batch)
+        fresh_actions_td = self.actor(fresh_batch_with_features)
+        fresh_actions = fresh_actions_td[("agents", "action")]
+        fresh_log_probs = fresh_actions_td.get("sample_log_prob", None)
+        
+            
+        fresh_q_input = TensorDict({
+            "_feature": fresh_batch_with_features["_feature"].detach(),  # detach feature避免重复梯度
+            ("agents", "action"): fresh_actions,
+        }, batch_size=batch.batch_size, device=self.device)
+        
+        q1_new = self.qvalue1(fresh_q_input)["state_action_value_1"]
+        q2_new = self.qvalue2(fresh_q_input)["state_action_value_2"]
         q_new = torch.min(q1_new, q2_new)
         
-        if current_log_probs is not None:
-            actor_loss = (alpha * current_log_probs.unsqueeze(-1) - q_new).mean()
+        if fresh_log_probs is not None:
+            if fresh_log_probs.dim() == 1:
+                fresh_log_probs = fresh_log_probs.unsqueeze(-1)
+            actor_loss = (alpha * fresh_log_probs - q_new).mean()
         else:
             actor_loss = -q_new.mean()
         
@@ -267,15 +311,16 @@ class SAC(TensorDictModuleBase):
         self.actor_optim.step()
         
         # Update alpha (temperature parameter)
-        if current_log_probs is not None:
-            alpha_loss = -(self.log_alpha * (current_log_probs + self.cfg.target_entropy if hasattr(self.cfg, 'target_entropy') else -self.action_dim).detach()).mean()
+        if fresh_log_probs is not None:
+            target_entropy = getattr(self.cfg, 'target_entropy', -self.action_dim)
+            alpha_loss = -(self.log_alpha * (fresh_log_probs.detach() + target_entropy)).mean()
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
             self.alpha_optim.step()
             # 使用detach来避免计算图问题
             self.alpha = self.log_alpha.exp().detach()
         else:
-            alpha_loss = torch.tensor(0.0)
+            alpha_loss = torch.tensor(0.0, device=self.device)
         
         # Soft update target networks
         self._soft_update(self.qvalue1_target, self.qvalue1, tau)

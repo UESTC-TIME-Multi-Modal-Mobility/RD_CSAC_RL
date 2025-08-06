@@ -27,12 +27,13 @@ def main(cfg):
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
 
     # Use Wandb to monitor training
+    wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     if (cfg.wandb.run_id is None):
         run = wandb.init(
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
             # entity=cfg.wandb.entity,
-            config=cfg,
+            config=wandb_config,
             mode=cfg.wandb.mode,
             id=wandb.util.generate_id(),
         )
@@ -41,7 +42,7 @@ def main(cfg):
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
             # entity=cfg.wandb.entity,
-            config=cfg,
+            config=wandb_config,
             mode=cfg.wandb.mode,
             id=cfg.wandb.run_id,
             resume="must"
@@ -98,6 +99,7 @@ def main(cfg):
     # Training Loop for SAC
         for i, data in enumerate(collector):
             # Add data to replay buffer
+            #TODO：这个地方有问题，没有添加动作与下一刻的状态，应该统一
             replay_buffer.extend(data)
             
             # Log Info
