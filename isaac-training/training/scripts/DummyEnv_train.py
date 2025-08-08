@@ -3,7 +3,7 @@
 Author: zdytim zdytim@foxmail.com
 Date: 2025-08-05 12:30:25
 LastEditors: zdytim zdytim@foxmail.com
-LastEditTime: 2025-08-05 12:31:51
+LastEditTime: 2025-08-07 00:02:48
 FilePath: /u20/NavRL/isaac-training/training/scripts/DummyEnv_train.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -246,8 +246,9 @@ def main(cfg):
             info = {"env_frames": i, "rollout_fps": 0}
 
             if replay_buffer.__len__() >= warmup_steps:
-                train_loss_stats = policy.train(replay_buffer)
+                train_loss_stats,rewards = policy.train(replay_buffer)
                 info.update(train_loss_stats)
+                info.update(rewards)
                 update_counter += 1
             else:
                 info.update({"status": "warming_up", "buffer_size": replay_buffer.__len__()})

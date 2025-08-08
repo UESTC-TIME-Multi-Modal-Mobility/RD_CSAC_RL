@@ -20,7 +20,7 @@ class SAC(TensorDictModuleBase):
         super().__init__()
         self.cfg = cfg
         self.device = device
-        
+        self.q_norm = ValueNorm(1).to(self.device)
         # Get action dimension from action_spec
         self.action_dim = action_spec.shape[-1]
 
@@ -132,7 +132,7 @@ class SAC(TensorDictModuleBase):
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
         self.qvalue1_optim = torch.optim.Adam(self.qvalue1.parameters(), lr=cfg.critic.learning_rate)
         self.qvalue2_optim = torch.optim.Adam(self.qvalue2.parameters(), lr=cfg.critic.learning_rate)
-        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate if hasattr(cfg, 'alpha_learning_rate') else 1e-7)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate if hasattr(cfg, 'alpha_learning_rate') else 1e-5)
 
         # Dummy Input for nn lazymodule
         dummy_input = observation_spec.zero()
@@ -187,19 +187,21 @@ class SAC(TensorDictModuleBase):
 
     def train(self, replay_buffer, batch_size=256, tau=0.005, alpha=0.2):
         """SAC training step"""
-        infos = []
-        update_steps = getattr(self.cfg, 'update_steps', 1)
+        loss_infos = []
+        reward_infos = []
+        update_steps = getattr(self.cfg, 'training_epoch_num', 1)
         for _ in range(update_steps):
             # Sample from replay buffer
             batch = replay_buffer.sample(batch_size).to(self.device)
-            for epoch in range(self.cfg.training_epoch_num):
-                batch1 = make_batch(batch, self.cfg.num_minibatches)
-                for minibatch in batch1:
-                    info = self._update_sac(minibatch, tau, alpha)
-                    infos.append(info)
-        infos = torch.stack(infos).to_tensordict()
-        infos = infos.apply(torch.mean, batch_size=[])
-        return {k: v.item() for k, v in infos.items()}
+            batch1 = make_batch(batch, self.cfg.num_minibatches)
+            for minibatch in batch1:
+                loss_info,reward_info = self._update_sac(minibatch, tau, alpha)
+                loss_infos.append(loss_info)
+                reward_infos.append(reward_info)
+        loss_infos = torch.stack(loss_infos).to_tensordict()
+        loss_infos = loss_infos.apply(torch.mean, batch_size=[])
+        reward_infos = torch.stack(reward_infos).to_tensordict()
+        return {k: v.mean().item() for k, v in loss_infos.items()}, {k: v.mean().item() for k, v in reward_infos.items()}
 
     def _update_sac(self, batch, tau=0.005, alpha=None):
         """Single SAC update step"""
@@ -209,7 +211,7 @@ class SAC(TensorDictModuleBase):
         # Feature extraction for current states
         batch_with_features = self.feature_extractor(batch)
         
-        # Get current actions and log probs from policy
+        # # Get current actions and log probs from policy
         current_actions_td = self.actor(batch_with_features)
         current_actions = current_actions_td[("agents", "action")]
         current_log_probs = current_actions_td.get("sample_log_prob", None)
@@ -217,6 +219,8 @@ class SAC(TensorDictModuleBase):
         # Extract data from batch
         rewards = batch["next", "agents", "reward"]
         dones = batch["next", "terminated"]
+        # self.value_norm.update(rewards)
+        # rewards = self.value_norm.normalize(rewards)
         
         # Update Q-functions
         with torch.no_grad():
@@ -246,7 +250,8 @@ class SAC(TensorDictModuleBase):
                 next_log_probs = next_log_probs.unsqueeze(-1)  # [batch, 1]
             
             target_q = rewards + self.gamma * (1 - dones.float()) * (next_q - alpha * next_log_probs)
-        
+            self.q_norm.update(target_q)
+            next_q = self.q_norm.normalize(target_q)
         # Current Q-values - 分别计算避免共享计算图
         current_actions_batch = batch[("agents", "action")]
         
@@ -264,7 +269,8 @@ class SAC(TensorDictModuleBase):
         
         current_q1 = self.qvalue1(current_q1_input)["state_action_value_1"]
         current_q2 = self.qvalue2(current_q2_input)["state_action_value_2"]
-        
+        current_q1 = self.q_norm.normalize(current_q1)
+        current_q2 = self.q_norm.normalize(current_q2)
         # Q-function losses - 分别计算
         target_q_detached = target_q.detach()
         q1_loss = F.mse_loss(current_q1, target_q_detached)
@@ -294,7 +300,7 @@ class SAC(TensorDictModuleBase):
         q1_new = self.qvalue1(fresh_q_input)["state_action_value_1"]
         q2_new = self.qvalue2(fresh_q_input)["state_action_value_2"]
         q_new = torch.min(q1_new, q2_new)
-        
+        q_new = self.q_norm.normalize(q_new)
         if fresh_log_probs is not None:
             if fresh_log_probs.dim() == 1:
                 fresh_log_probs = fresh_log_probs.unsqueeze(-1)
@@ -306,7 +312,6 @@ class SAC(TensorDictModuleBase):
         self.feature_extractor_optim.zero_grad()
         self.actor_optim.zero_grad()
         actor_loss.backward()
-        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.)
         self.feature_extractor_optim.step()
         self.actor_optim.step()
         
@@ -332,7 +337,17 @@ class SAC(TensorDictModuleBase):
             "q2_loss": q2_loss,
             "alpha_loss": alpha_loss,
             "alpha": self.alpha,
-            "actor_grad_norm": actor_grad_norm,
+        }, []),TensorDict({
+            "reward_mean": rewards.mean(),
+            "reward_max": rewards.max(),
+            "reward_min": rewards.min(),
+            "q1_mean": current_q1.mean(),
+            "q2_mean": current_q2.mean(),
+            "target_q_mean": target_q.mean(),
+            "actor_loss_mean": actor_loss.mean(),
+            "q1_loss_mean": q1_loss.mean(),
+            "q2_loss_mean": q2_loss.mean(),
+            "alpha_loss_mean": alpha_loss.mean(),
         }, [])
     
     def _soft_update(self, target, source, tau):

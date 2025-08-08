@@ -43,7 +43,7 @@ class PPO(TensorDictModuleBase):
             TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
         ).to(self.device)
 
-        # Actor etwork
+        # Actor network
         self.n_agents, self.action_dim = action_spec.shape
         self.actor = ProbabilisticActor(
             TensorDictModule(BetaActor(self.action_dim), ["_feature"], ["alpha", "beta"]),

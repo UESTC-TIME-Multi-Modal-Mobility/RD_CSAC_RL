@@ -67,7 +67,7 @@ def main(cfg):
     # Replay Buffer for SAC
     replay_buffer = TensorDictReplayBuffer(
         storage=LazyTensorStorage(max_size=cfg.algo.buffer_size),
-        batch_size=cfg.algo.batch_size if hasattr(cfg.algo, 'batch_size') else 128,
+        batch_size=cfg.algo.batch_size if hasattr(cfg.algo, 'batch_size') else 256,
     )
 
     # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
@@ -108,8 +108,9 @@ def main(cfg):
             # Start training only after warmup
             if replay_buffer.__len__() >= warmup_steps:
                 # Train Policy with SAC
-                train_loss_stats = policy.train(replay_buffer)
+                train_loss_stats,rewards = policy.train(replay_buffer)
                 info.update(train_loss_stats)
+                info.update(rewards)
                 update_counter += 1
             else:
                 info.update({"status": "warming_up", "buffer_size": replay_buffer.__len__()})
