@@ -20,7 +20,7 @@ class SAC(TensorDictModuleBase):
         super().__init__()
         self.cfg = cfg
         self.device = device
-        self.q_norm = ValueNorm(1).to(self.device)
+        # self.q_norm = ValueNorm(1).to(self.device)
         # Get action dimension from action_spec
         self.action_dim = action_spec.shape[-1]
 
@@ -55,34 +55,41 @@ class SAC(TensorDictModuleBase):
             scale_lb=cfg.network.scale_lb,
         ).to(self.device)
 
-        actor_module = TensorDictSequential(
-            self.feature_extractor,
-            TensorDictModule(
-                nn.Linear(256, self.action_dim * 2),  # 256 -> 6 (假设action_dim=3)
-                in_keys=["_feature"],
-                out_keys=["actor_params"]
-            ),
-            TensorDictModule(
-                actor_extractor,
-                in_keys=["actor_params"],
-                out_keys=["loc", "scale"]
-            ),
-        ).to(self.device)
+        # actor_module = TensorDictSequential(
+        #     self.feature_extractor,
+        #     TensorDictModule(
+        #         nn.Linear(256, self.action_dim * 2),  # 256 -> 6 (假设action_dim=3)
+        #         in_keys=["_feature"],
+        #         out_keys=["actor_params"]
+        #     ),
+        #     TensorDictModule(
+        #         actor_extractor,
+        #         in_keys=["actor_params"],
+        #         out_keys=["loc", "scale"]
+        #     ),
+        # ).to(self.device)
 
+        # self.actor = ProbabilisticActor(
+        #     spec=action_spec,
+        #     in_keys=["loc", "scale"],
+        #     module=actor_module,
+        #     distribution_class=TanhNormal,
+        #     distribution_kwargs={"tanh_loc": False},
+        #     default_interaction_type=InteractionType.RANDOM,
+        #     return_log_prob=True,
+        #     out_keys=[("agents", "action_normalized")]  # 直接输出到目标动作范围
+        # ).to(self.device)
         self.actor = ProbabilisticActor(
-            spec=action_spec,
-            in_keys=["loc", "scale"],
-            module=actor_module,
-            distribution_class=TanhNormal,
-            distribution_kwargs={"tanh_loc": False},
-            default_interaction_type=InteractionType.RANDOM,
-            return_log_prob=True,
-            out_keys=[("agents", "action")]  # 直接输出到目标动作范围
+            TensorDictModule(BetaActor(self.action_dim), ["_feature"], ["alpha", "beta"]),
+            in_keys=["alpha", "beta"],
+            out_keys=[("agents", "action_normalized")], 
+            distribution_class=IndependentBeta,
+            return_log_prob=True
         ).to(self.device)
-
+        
         # SAC 需要两个 Q 网络 - 使用CatTensors来连接feature和action
         self.qvalue1 = TensorDictSequential(
-            CatTensors(["_feature", ("agents", "action")], "_feature_action", del_keys=False),
+            CatTensors(["_feature", ("agents", "action_normalized")], "_feature_action", del_keys=False),
             TensorDictModule(
                 nn.Sequential(
                     nn.Linear(256 + self.action_dim, 256),  # feature + action
@@ -97,7 +104,7 @@ class SAC(TensorDictModuleBase):
         ).to(self.device)
 
         self.qvalue2 = TensorDictSequential(
-            CatTensors(["_feature", ("agents", "action")], "_feature_action", del_keys=False),
+            CatTensors(["_feature", ("agents", "action_normalized")], "_feature_action", del_keys=False),
             TensorDictModule(
                 nn.Sequential(
                     nn.Linear(256 + self.action_dim, 256),
@@ -175,13 +182,7 @@ class SAC(TensorDictModuleBase):
         tensordict = tensordict.to(self.device)
         self.feature_extractor(tensordict)
         self.actor(tensordict)
-        # Note: For SAC, we don't call Q-networks in forward pass like PPO's critic
-        # Q-networks are only used during training
-
-        # Cooridnate change: transform local to world
-        # SAC风格：TanhNormal已经输出合适范围的action
-        actions = tensordict["agents", "action"] * self.cfg.actor.action_limit
-        actions_world = vec_to_world(actions, tensordict["agents", "observation", "direction"])
+        actions_world = self.actions_to_world(tensordict[("agents", "action_normalized")], tensordict)
         tensordict["agents", "action"] = actions_world
         return tensordict
 
@@ -212,9 +213,11 @@ class SAC(TensorDictModuleBase):
         batch_with_features = self.feature_extractor(batch)
         
         # # Get current actions and log probs from policy
-        current_actions_td = self.actor(batch_with_features)
-        current_actions = current_actions_td[("agents", "action")]
-        current_log_probs = current_actions_td.get("sample_log_prob", None)
+        # current_actions_td = self.actor(batch_with_features)
+        # current_actions = current_actions_td[("agents", "action")].squeeze(1) 
+        # current_log_probs = current_actions_td.get("sample_log_prob", None)
+        current_actions_td = self.actor.get_dist(batch)
+        current_log_probs = current_actions_td.log_prob(batch[("agents", "action_normalized")])
         
         # Extract data from batch
         rewards = batch["next", "agents", "reward"]
@@ -230,95 +233,99 @@ class SAC(TensorDictModuleBase):
             }, batch_size=batch["next"].batch_size, device=self.device)
             next_batch_with_features = self.feature_extractor(next_batch)
             next_actions_td = self.actor(next_batch_with_features)
-            next_actions = next_actions_td[("agents", "action")]
+            next_actions = next_actions_td[("agents", "action_normalized")].squeeze(1)
             next_log_probs = next_actions_td.get("sample_log_prob", torch.zeros(batch.batch_size[0], device=self.device))
-            
-            
+
             # 构造Q网络的输入TensorDict
             next_q_input = TensorDict({
                 "_feature": next_batch_with_features["_feature"],
-                ("agents", "action"): next_actions,
+                ("agents", "action_normalized"): next_actions,
             }, batch_size=batch.batch_size, device=self.device)
             
             # Compute target Q-values using target networks
             next_q1 = self.qvalue1_target(next_q_input)["state_action_value_1"]
             next_q2 = self.qvalue2_target(next_q_input)["state_action_value_2"]
             next_q = torch.min(next_q1, next_q2)
-            
+            # self.q_norm.update(next_q)
+            # next_q = self.q_norm.normalize(next_q)
             # 处理log_probs维度
             if next_log_probs.dim() == 1:
                 next_log_probs = next_log_probs.unsqueeze(-1)  # [batch, 1]
             
             target_q = rewards + self.gamma * (1 - dones.float()) * (next_q - alpha * next_log_probs)
-            self.q_norm.update(target_q)
-            next_q = self.q_norm.normalize(target_q)
+
         # Current Q-values - 分别计算避免共享计算图
-        current_actions_batch = batch[("agents", "action")]
+        current_actions_batch = batch[("agents", "action_normalized")]
         
         # 为Q1计算单独的输入
         current_q1_input = TensorDict({
             "_feature": batch_with_features["_feature"].detach().clone(),  # detach并clone避免共享
-            ("agents", "action"): current_actions_batch.detach().clone(),
+            ("agents", "action_normalized"): current_actions_batch.detach().clone(),
         }, batch_size=batch.batch_size, device=self.device)
         
         # 为Q2计算单独的输入
         current_q2_input = TensorDict({
             "_feature": batch_with_features["_feature"].detach().clone(),
-            ("agents", "action"): current_actions_batch.detach().clone(),
+            ("agents", "action_normalized"): current_actions_batch.detach().clone(),
         }, batch_size=batch.batch_size, device=self.device)
         
         current_q1 = self.qvalue1(current_q1_input)["state_action_value_1"]
         current_q2 = self.qvalue2(current_q2_input)["state_action_value_2"]
-        current_q1 = self.q_norm.normalize(current_q1)
-        current_q2 = self.q_norm.normalize(current_q2)
+        current_q = torch.min(current_q1, current_q2)
+        # current_q1 = self.q_norm.normalize(current_q1)
+        # current_q2 = self.q_norm.normalize(current_q2)
         # Q-function losses - 分别计算
         target_q_detached = target_q.detach()
         q1_loss = F.mse_loss(current_q1, target_q_detached)
         q2_loss = F.mse_loss(current_q2, target_q_detached)
-        
+
+        if current_log_probs is not None:
+            if current_log_probs.dim() == 1:
+                current_log_probs = current_log_probs.unsqueeze(-1)
+            actor_loss = (self.alpha * current_log_probs - current_q.detach()).mean()
+        else:
+            actor_loss = current_q.mean()
+        self.feature_extractor_optim.zero_grad()
+        self.actor_optim.zero_grad()
+        actor_loss.backward()
+        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.) # to prevent gradient growing too large
+        self.feature_extractor_optim.step()
+        self.actor_optim.step()
         # Update Q-functions separately
         self.qvalue1_optim.zero_grad()
         q1_loss.backward()
+        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.qvalue1.parameters(), max_norm=5.)
         self.qvalue1_optim.step()
         
         self.qvalue2_optim.zero_grad()
         q2_loss.backward()
+        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.qvalue1.parameters(), max_norm=5.)
         self.qvalue2_optim.step()
+
         
         # Update actor - 重新前向传播获得新的actions
-        fresh_batch_with_features = self.feature_extractor(batch)
-        fresh_actions_td = self.actor(fresh_batch_with_features)
-        fresh_actions = fresh_actions_td[("agents", "action")]
-        fresh_log_probs = fresh_actions_td.get("sample_log_prob", None)
+        # fresh_batch_with_features = self.feature_extractor(batch)
+        # fresh_actions_td = self.actor(fresh_batch_with_features)
+        # fresh_actions = fresh_actions_td[("agents", "action_normalized")].squeeze(1)
+        # fresh_log_probs = fresh_actions_td.get("sample_log_prob", None)
         
             
-        fresh_q_input = TensorDict({
-            "_feature": fresh_batch_with_features["_feature"].detach(),  # detach feature避免重复梯度
-            ("agents", "action"): fresh_actions,
-        }, batch_size=batch.batch_size, device=self.device)
+        # fresh_q_input = TensorDict({
+        #     "_feature": fresh_batch_with_features["_feature"].detach(),  # detach feature避免重复梯度
+        #     ("agents", "action_normalized"): fresh_actions,
+        # }, batch_size=batch.batch_size, device=self.device)
         
-        q1_new = self.qvalue1(fresh_q_input)["state_action_value_1"]
-        q2_new = self.qvalue2(fresh_q_input)["state_action_value_2"]
-        q_new = torch.min(q1_new, q2_new)
-        q_new = self.q_norm.normalize(q_new)
-        if fresh_log_probs is not None:
-            if fresh_log_probs.dim() == 1:
-                fresh_log_probs = fresh_log_probs.unsqueeze(-1)
-            actor_loss = (alpha * fresh_log_probs - q_new).mean()
-        else:
-            actor_loss = -q_new.mean()
-        
+        # q1_new = self.qvalue1(fresh_q_input)["state_action_value_1"]
+        # q2_new = self.qvalue2(fresh_q_input)["state_action_value_2"]
+        # q_new = torch.min(q1_new, q2_new)
+        # q_new = self.q_norm.normalize(q_new)
+
         # Update actor
-        self.feature_extractor_optim.zero_grad()
-        self.actor_optim.zero_grad()
-        actor_loss.backward()
-        self.feature_extractor_optim.step()
-        self.actor_optim.step()
         
         # Update alpha (temperature parameter)
-        if fresh_log_probs is not None:
+        if current_log_probs is not None:
             target_entropy = getattr(self.cfg, 'target_entropy', -self.action_dim)
-            alpha_loss = -(self.log_alpha * (fresh_log_probs.detach() + target_entropy)).mean()
+            alpha_loss = -(self.log_alpha * (current_log_probs.detach() + target_entropy)).mean()
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
             self.alpha_optim.step()
@@ -339,8 +346,8 @@ class SAC(TensorDictModuleBase):
             "alpha": self.alpha,
         }, []),TensorDict({
             "reward_mean": rewards.mean(),
-            "reward_max": rewards.max(),
-            "reward_min": rewards.min(),
+            # "reward_max": rewards.max(),
+            # "reward_min": rewards.min(),
             "q1_mean": current_q1.mean(),
             "q2_mean": current_q2.mean(),
             "target_q_mean": target_q.mean(),
@@ -354,3 +361,9 @@ class SAC(TensorDictModuleBase):
         """Soft update target network parameters"""
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - tau) + source_param.data * tau)
+    
+    def actions_to_world(self, actions, tensordict):
+        """将动作从局部坐标系转换到世界坐标系"""
+        actions = (2*actions * self.cfg.actor.action_limit)-self.cfg.actor.action_limit
+        actions_world = vec_to_world(actions,tensordict["agents", "observation", "direction"])
+        return actions_world

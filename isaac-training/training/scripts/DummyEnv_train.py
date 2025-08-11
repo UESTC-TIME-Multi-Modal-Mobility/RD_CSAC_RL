@@ -3,7 +3,7 @@
 Author: zdytim zdytim@foxmail.com
 Date: 2025-08-05 12:30:25
 LastEditors: zdytim zdytim@foxmail.com
-LastEditTime: 2025-08-07 00:02:48
+LastEditTime: 2025-08-11 15:55:05
 FilePath: /u20/NavRL/isaac-training/training/scripts/DummyEnv_train.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -80,7 +80,7 @@ class DummyEnv:
                     "state": torch.randn(self.num_envs, self.num_frames, 8, device=self.device),
                     "direction": torch.randn(self.num_envs, self.num_frames, 1, 3, device=self.device),
                 }, batch_size=[self.num_envs, self.num_frames], device=self.device),
-                "action": torch.randn(self.num_envs, self.num_frames, 1, 3, device=self.device),  # SAC输出的动作
+                "action_normalized": torch.randn(self.num_envs, self.num_frames, 1, 3, device=self.device),  # SAC输出的动作
             }, batch_size=[self.num_envs, self.num_frames], device=self.device),
             
             # 特征提取器输出（SAC网络会生成这些）
