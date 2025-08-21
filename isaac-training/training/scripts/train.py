@@ -6,12 +6,12 @@ import wandb
 import torch
 from omegaconf import DictConfig, OmegaConf
 from omni.isaac.kit import SimulationApp
-from SAC import SAC
+from SAC_v1 import SAC
 from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
 from torchrl.envs.transforms import TransformedEnv, Compose
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage,TensorDictPrioritizedReplayBuffer
 # from torch.cuda.amp import autocast, GradScaler
 from utils import evaluate
 from torchrl.envs.utils import ExplorationType
@@ -63,8 +63,16 @@ def main(cfg):
     
     # SAC Policy
     policy = SAC(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
-    
     # Replay Buffer for SAC
+    # replay_buffer = TensorDictPrioritizedReplayBuffer(
+    #     alpha=0.6,                  # 优先级幂指数
+    #     beta=0.4,                   # IS权重补偿
+    #     storage=LazyTensorStorage(max_size=cfg.algo.buffer_size),
+    #     # sampler=sampler,
+    #     batch_size=cfg.algo.batch_size if hasattr(cfg.algo, 'batch_size') else 256,
+    #     priority_key="td_error",
+    # )
+    # Replay buffer
     replay_buffer = TensorDictReplayBuffer(
         storage=LazyTensorStorage(max_size=cfg.algo.buffer_size),
         batch_size=cfg.algo.batch_size if hasattr(cfg.algo, 'batch_size') else 256,
@@ -85,21 +93,21 @@ def main(cfg):
     collector = SyncDataCollector(
         transformed_env,
         policy=policy, 
-        frames_per_batch=cfg.env.num_envs * cfg.algo.training_frame_num, 
+        frames_per_batch=cfg.env.num_envs * cfg.training_frame_num, 
         total_frames=cfg.max_frame_num,
         device=cfg.device,
         return_same_td=True,
         exploration_type=ExplorationType.RANDOM,
     )
     
+
     # SAC specific variables
     update_counter = 0
-    warmup_steps = cfg.algo.warmup_steps if hasattr(cfg.algo, 'warmup_steps') else 1000
+    warmup_steps = cfg.algo.warmup_steps if hasattr(cfg.algo, 'buffer_size') else 200_000
     try:
     # Training Loop for SAC
         for i, data in enumerate(collector):
             # Add data to replay buffer
-            #TODO：这个地方有问题，没有添加动作与下一刻的状态，应该统一
             replay_buffer.extend(data)
             
             # Log Info
@@ -108,10 +116,11 @@ def main(cfg):
             # Start training only after warmup
             if replay_buffer.__len__() >= warmup_steps:
                 # Train Policy with SAC
-                train_loss_stats,rewards = policy.train(replay_buffer)
+                train_loss_stats = policy.train(replay_buffer,batch_size=cfg.algo.batch_size)
+                # replay_buffer.update_priority(indices, td_error)
                 info.update(train_loss_stats)
-                info.update(rewards)
                 update_counter += 1
+                # replay_buffer._sampler.beta  = min(1.0, replay_buffer.beta + 1e-4)
             else:
                 info.update({"status": "warming_up", "buffer_size": replay_buffer.__len__()})
             
@@ -125,7 +134,7 @@ def main(cfg):
                 info.update(stats)
 
             # Evaluate policy and log info
-            if i % cfg.eval_interval == 0:
+            if i % cfg.eval_interval == 0 and i > 0:
                 print(f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] start evaluating policy at training step:{i}")
                 # print("[NavRL]: start evaluating policy at training step: ", i)
                 env.enable_render(True)
@@ -148,13 +157,14 @@ def main(cfg):
             
             # Update wandb info
             run.log(info)
-            print(f"\n[Step {i}] SAC Training Summary:")
-            for k, v in info.items():
-                if isinstance(v, (float, int)):
-                    print(f"  {k:<20}: {v:.4f}")
-            print(f"  Buffer Size: {replay_buffer.__len__()}")
-            print(f"  Updates: {update_counter}")
-            print("-" * 40)
+            if i%100 ==0:
+                print(f"\n[Step {i}] SAC Training Summary:")
+                for k, v in info.items():
+                    if isinstance(v, (float, int)):
+                        print(f"  {k:<20}: {v:.4f}")
+                print(f"  Buffer Size: {replay_buffer.__len__()}")
+                print(f"  Updates: {update_counter}")
+                print("-" * 40)
             
 
             # Save Model
