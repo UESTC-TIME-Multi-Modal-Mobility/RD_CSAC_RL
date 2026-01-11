@@ -6,12 +6,12 @@ from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDict
 from einops.layers.torch import Rearrange
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
-from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
+from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world,GaussianActor
 from model import ViT,ConvNet
 from torchrl.modules.distributions import TanhNormal
-from tensordict.nn import InteractionType, TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
 from copy import deepcopy
+from tensordict.tensordict import TensorDict
 # from torch.cuda.amp import autocast, GradScaler
 
 
@@ -20,103 +20,13 @@ class SAC(TensorDictModuleBase):
         super().__init__()
         self.cfg = cfg
         self.device = device
-        # self.q_norm = ValueNorm(1).to(self.device)
+        self.r_norm = ValueNorm(1).to(self.device)
         # Get action dimension from action_spec
         self.action_dim = action_spec.shape[-1]
 
-        # self.scaler = GradScaler()
-        # Feature extractor for LiDAR()
-        feature_extractor_network = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
-            Rearrange("n c w h -> n (c w h)"),
-            nn.LazyLinear(128), nn.LayerNorm(128),
-        ).to(self.device)
-        
-        # feature_extractor_network = ViT().to(self.device)  # Use ViT as the feature extractor
-        # feature_extractor_network = ConvNet().to(self.device)  # Use ViT as the feature extractor
-        # Dynamic obstacle information extractor
-        dynamic_obstacle_network = nn.Sequential(
-            Rearrange("n c w h -> n (c w h)"),
-            make_mlp([128, 64])
-        ).to(self.device)
-
-        # Feature extractor
-        self.feature_extractor = TensorDictSequential(
-            TensorDictModule(feature_extractor_network, [("agents", "observation", "lidar")], ["_cnn_feature"]),
-            TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
-            CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
-            TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
-        ).to(self.device)
-
-        actor_extractor = NormalParamExtractor(
-            scale_mapping=f"biased_softplus_{cfg.network.default_policy_scale}",
-            scale_lb=cfg.network.scale_lb,
-        ).to(self.device)
-
-        # actor_module = TensorDictSequential(
-        #     self.feature_extractor,
-        #     TensorDictModule(
-        #         nn.Linear(256, self.action_dim * 2),  # 256 -> 6 (假设action_dim=3)
-        #         in_keys=["_feature"],
-        #         out_keys=["actor_params"]
-        #     ),
-        #     TensorDictModule(
-        #         actor_extractor,
-        #         in_keys=["actor_params"],
-        #         out_keys=["loc", "scale"]
-        #     ),
-        # ).to(self.device)
-
-        # self.actor = ProbabilisticActor(
-        #     spec=action_spec,
-        #     in_keys=["loc", "scale"],
-        #     module=actor_module,
-        #     distribution_class=TanhNormal,
-        #     distribution_kwargs={"tanh_loc": False},
-        #     default_interaction_type=InteractionType.RANDOM,
-        #     return_log_prob=True,
-        #     out_keys=[("agents", "action_normalized")]  # 直接输出到目标动作范围
-        # ).to(self.device)
-        self.actor = ProbabilisticActor(
-            TensorDictModule(BetaActor(self.action_dim), ["_feature"], ["alpha", "beta"]),
-            in_keys=["alpha", "beta"],
-            out_keys=[("agents", "action_normalized")], 
-            distribution_class=IndependentBeta,
-            return_log_prob=True
-        ).to(self.device)
-        
-        # SAC 需要两个 Q 网络 - 使用CatTensors来连接feature和action
-        self.qvalue1 = TensorDictSequential(
-            CatTensors(["_feature", ("agents", "action_normalized")], "_feature_action", del_keys=False),
-            TensorDictModule(
-                nn.Sequential(
-                    nn.Linear(256 + self.action_dim, 256),  # feature + action
-                    nn.ReLU(),
-                    nn.Linear(256, 256),
-                    nn.ReLU(),
-                    nn.Linear(256, 1)
-                ),
-                in_keys=["_feature_action"],
-                out_keys=["state_action_value_1"]
-            )
-        ).to(self.device)
-
-        self.qvalue2 = TensorDictSequential(
-            CatTensors(["_feature", ("agents", "action_normalized")], "_feature_action", del_keys=False),
-            TensorDictModule(
-                nn.Sequential(
-                    nn.Linear(256 + self.action_dim, 256),
-                    nn.ReLU(),
-                    nn.Linear(256, 256),
-                    nn.ReLU(),
-                    nn.Linear(256, 1)
-                ),
-                in_keys=["_feature_action"],
-                out_keys=["state_action_value_2"]
-            )
-        ).to(self.device)
+        self.actor = ActorNetwork(self.action_dim,self.device).to(self.device)
+        self.qvalue1 = CriticNetwork(self.action_dim,self.device).to(self.device)
+        self.qvalue2 = CriticNetwork(self.action_dim,self.device).to(self.device)
 
         # Target Q 网络
         from copy import deepcopy
@@ -125,32 +35,24 @@ class SAC(TensorDictModuleBase):
 
         # 温度参数 alpha（自适应熵调节）
         self.log_alpha = nn.Parameter(torch.zeros(1, device=device))
-        # 使用detach来避免计算图问题
+        # self.log_alpha = nn.Parameter(torch.tensor([0.693], device=device))
         self.alpha = self.log_alpha.exp().detach()
         
         # SAC参数
         self.gamma = getattr(cfg, 'gamma', 0.99)  # 折扣因子
 
-        # Loss related
-        self.critic_loss_fn = nn.HuberLoss(delta=10) # huberloss (L1+L2): https://pytorch.org/docs/stable/generated/torch.nn.HuberLoss.html
-
         # Optimizer
-        self.feature_extractor_optim = torch.optim.Adam(self.feature_extractor.parameters(), lr=cfg.feature_extractor.learning_rate)
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
         self.qvalue1_optim = torch.optim.Adam(self.qvalue1.parameters(), lr=cfg.critic.learning_rate)
         self.qvalue2_optim = torch.optim.Adam(self.qvalue2.parameters(), lr=cfg.critic.learning_rate)
-        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate if hasattr(cfg, 'alpha_learning_rate') else 1e-5)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate if hasattr(cfg, 'alpha_learning_rate') else 1e-4)
 
-        # Dummy Input for nn lazymodule
+        # Dummy Input for nn lazy module
         dummy_input = observation_spec.zero()
         # print("dummy_input: ", dummy_input)
 
-        # 使用no_grad来避免计算图
         with torch.no_grad():
             self.__call__(dummy_input)
-
-        # 确保所有参数都分离计算图
-        self._detach_all_params()
 
         # Initialize network
         def init_(module):
@@ -160,28 +62,18 @@ class SAC(TensorDictModuleBase):
         self.actor.apply(init_)
         self.qvalue1.apply(init_)
         self.qvalue2.apply(init_)
-
-    def _detach_all_params(self):
-        """确保所有参数都分离计算图，避免deepcopy问题"""
-        with torch.no_grad():
-            for module in [self.feature_extractor, self.actor, self.qvalue1, self.qvalue2]:
-                for param in module.parameters():
-                    if param.grad is not None:
-                        param.grad = None
-                    param.data = param.data.detach()
-                for buffer in module.buffers():
-                    buffer.data = buffer.data.detach()
-            
-            # 处理alpha参数
-            if self.log_alpha.grad is not None:
-                self.log_alpha.grad = None
-            self.log_alpha.data = self.log_alpha.data.detach()
-            self.alpha = self.log_alpha.exp().detach()
+        self.qvalue1_target.apply(init_)
+        self.qvalue2_target.apply(init_)
+        
 
     def __call__(self, tensordict):
         tensordict = tensordict.to(self.device)
-        self.feature_extractor(tensordict)
-        self.actor(tensordict)
+        actor,actor_lp = self.actor(tensordict["agents"])
+        tensordict["agents","action_normalized"] = actor["action_normalized"]
+        self.qvalue1(TensorDict({"observation": tensordict["agents", "observation"],"action_normalized": tensordict["agents", "action_normalized"]},batch_size=tensordict.batch_size, device=self.device))
+        self.qvalue2(TensorDict({"observation": tensordict["agents", "observation"],"action_normalized": tensordict["agents", "action_normalized"]},batch_size=tensordict.batch_size, device=self.device))
+        self.qvalue1_target(TensorDict({"observation": tensordict["agents", "observation"],"action_normalized": tensordict["agents", "action_normalized"]},batch_size=tensordict.batch_size, device=self.device))
+        self.qvalue2_target(TensorDict({"observation": tensordict["agents", "observation"],"action_normalized": tensordict["agents", "action_normalized"]}, batch_size=tensordict.batch_size, device=self.device))
         actions_world = self.actions_to_world(tensordict[("agents", "action_normalized")], tensordict)
         tensordict["agents", "action"] = actions_world
         return tensordict
@@ -190,151 +82,122 @@ class SAC(TensorDictModuleBase):
         """SAC training step"""
         loss_infos = []
         reward_infos = []
-        update_steps = getattr(self.cfg, 'training_epoch_num', 1)
+        self.replay_buffer = replay_buffer
+        update_steps = getattr(self.cfg, 'training_epoch_num', 5)
         for _ in range(update_steps):
             # Sample from replay buffer
-            batch = replay_buffer.sample(batch_size).to(self.device)
+            batch= replay_buffer.sample(batch_size).to(self.device)
+            # with torch.no_grad():
+            # self.r_norm.update(batch["next", "agents", "reward"])
+            # normed_reward = self.r_norm.normalize(batch["next", "agents", "reward"])
+            # batch["next", "agents", "reward"] = normed_reward
             batch1 = make_batch(batch, self.cfg.num_minibatches)
             for minibatch in batch1:
                 loss_info,reward_info = self._update_sac(minibatch, tau, alpha)
                 loss_infos.append(loss_info)
-                reward_infos.append(reward_info)
+                
+                # # 计算 TD-Error
+                # td_error = self._compute_td_error(minibatch)
+                # td_errors.append(td_error)
+                # indices_list.append(indices)
         loss_infos = torch.stack(loss_infos).to_tensordict()
         loss_infos = loss_infos.apply(torch.mean, batch_size=[])
-        reward_infos = torch.stack(reward_infos).to_tensordict()
-        return {k: v.mean().item() for k, v in loss_infos.items()}, {k: v.mean().item() for k, v in reward_infos.items()}
+        return {k: v.mean().item() for k, v in loss_infos.items()}
+
 
     def _update_sac(self, batch, tau=0.005, alpha=None):
         """Single SAC update step"""
-        if alpha is None:
-            alpha = self.alpha
-            
-        # Feature extraction for current states
-        batch_with_features = self.feature_extractor(batch)
-        
-        # # Get current actions and log probs from policy
-        # current_actions_td = self.actor(batch_with_features)
-        # current_actions = current_actions_td[("agents", "action")].squeeze(1) 
-        # current_log_probs = current_actions_td.get("sample_log_prob", None)
-        current_actions_td = self.actor.get_dist(batch)
-        current_log_probs = current_actions_td.log_prob(batch[("agents", "action_normalized")])
-        
+        #===================== 1. 公共特征提取 =====================
         # Extract data from batch
         rewards = batch["next", "agents", "reward"]
-        dones = batch["next", "terminated"]
-        # self.value_norm.update(rewards)
-        # rewards = self.value_norm.normalize(rewards)
-        
-        # Update Q-functions
-        with torch.no_grad():
-            # Get next state features and actions
-            next_batch = TensorDict({
-                "agents": batch["next", "agents"]
-            }, batch_size=batch["next"].batch_size, device=self.device)
-            next_batch_with_features = self.feature_extractor(next_batch)
-            next_actions_td = self.actor(next_batch_with_features)
-            next_actions = next_actions_td[("agents", "action_normalized")].squeeze(1)
-            next_log_probs = next_actions_td.get("sample_log_prob", torch.zeros(batch.batch_size[0], device=self.device))
+        # rewards_init = self.r_norm.denormalize(rewards)
+        dones = (
+            batch['next', 'terminated'].squeeze(-1).to(torch.bool)
+            | batch['next', 'truncated'].squeeze(-1).to(torch.bool)
+        ).float().to(self.device)
+        observations = batch["agents"]
+        next_observations = batch["next", "agents"]
+        actors = batch["agents", "action_normalized"]
+        # ===================== 2. Actor更新分支 =====================
+        # 2.1 使用当前策略重新采样动作
+        actions,actor_lp = self.actor(observations)
+        # actor_lp = actions_td.get("sample_log_prob")
+        next_actions, next_actions_lp = self.actor(next_observations)
+        # print(f"Actor log_prob mean: {actor_lp.mean().item()}")
+        q_input = TensorDict({
+            "observation": observations["observation"],
+            "action_normalized": actors.squeeze(1),
+        }, batch_size=batch.batch_size, device=self.device)
+        q1 = self.qvalue1(q_input)
+        q2 = self.qvalue2(q_input)
 
-            # 构造Q网络的输入TensorDict
-            next_q_input = TensorDict({
-                "_feature": next_batch_with_features["_feature"],
-                ("agents", "action_normalized"): next_actions,
-            }, batch_size=batch.batch_size, device=self.device)
-            
-            # Compute target Q-values using target networks
-            next_q1 = self.qvalue1_target(next_q_input)["state_action_value_1"]
-            next_q2 = self.qvalue2_target(next_q_input)["state_action_value_2"]
-            next_q = torch.min(next_q1, next_q2)
-            # self.q_norm.update(next_q)
-            # next_q = self.q_norm.normalize(next_q)
-            # 处理log_probs维度
-            if next_log_probs.dim() == 1:
-                next_log_probs = next_log_probs.unsqueeze(-1)  # [batch, 1]
-            
-            target_q = rewards + self.gamma * (1 - dones.float()) * (next_q - alpha * next_log_probs)
-
-        # Current Q-values - 分别计算避免共享计算图
-        current_actions_batch = batch[("agents", "action_normalized")]
-        
-        # 为Q1计算单独的输入
-        current_q1_input = TensorDict({
-            "_feature": batch_with_features["_feature"].detach().clone(),  # detach并clone避免共享
-            ("agents", "action_normalized"): current_actions_batch.detach().clone(),
+        actor_q_input = TensorDict({
+            "observation": observations["observation"],
+            "action_normalized": actions["action_normalized"].squeeze(1),
+        }, batch_size=batch.batch_size, device=self.device)
+        next_q_input = TensorDict({
+            "observation": next_observations["observation"],
+            "action_normalized": next_actions["action_normalized"].squeeze(1),
         }, batch_size=batch.batch_size, device=self.device)
         
-        # 为Q2计算单独的输入
-        current_q2_input = TensorDict({
-            "_feature": batch_with_features["_feature"].detach().clone(),
-            ("agents", "action_normalized"): current_actions_batch.detach().clone(),
-        }, batch_size=batch.batch_size, device=self.device)
+        q1_actor = self.qvalue1(actor_q_input)
+        q2_actor = self.qvalue2(actor_q_input)
+        q_min = torch.min(q1_actor, q2_actor)
+        next_q1 = self.qvalue1_target(next_q_input)
+        next_q2 = self.qvalue2_target(next_q_input)
+        next_q_min = torch.min(next_q1, next_q2)
         
-        current_q1 = self.qvalue1(current_q1_input)["state_action_value_1"]
-        current_q2 = self.qvalue2(current_q2_input)["state_action_value_2"]
-        current_q = torch.min(current_q1, current_q2)
-        # current_q1 = self.q_norm.normalize(current_q1)
-        # current_q2 = self.q_norm.normalize(current_q2)
-        # Q-function losses - 分别计算
-        target_q_detached = target_q.detach()
-        q1_loss = F.mse_loss(current_q1, target_q_detached)
-        q2_loss = F.mse_loss(current_q2, target_q_detached)
-
-        if current_log_probs is not None:
-            if current_log_probs.dim() == 1:
-                current_log_probs = current_log_probs.unsqueeze(-1)
-            actor_loss = (self.alpha * current_log_probs - current_q.detach()).mean()
-        else:
-            actor_loss = current_q.mean()
-        self.feature_extractor_optim.zero_grad()
-        self.actor_optim.zero_grad()
-        actor_loss.backward()
-        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.) # to prevent gradient growing too large
-        self.feature_extractor_optim.step()
-        self.actor_optim.step()
-        # Update Q-functions separately
-        self.qvalue1_optim.zero_grad()
-        q1_loss.backward()
-        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.qvalue1.parameters(), max_norm=5.)
-        self.qvalue1_optim.step()
+        # loss
+        v_backup = next_q_min - self.alpha * next_actions_lp.unsqueeze(1)
+        v_backup = v_backup.detach()
+        q_backup = rewards + self.gamma * (1 - dones.float()) * v_backup
+        actor_loss = (self.alpha * actor_lp - q_min).mean()
+        q1_loss = F.mse_loss(q1, q_backup.detach())
+        q2_loss = F.mse_loss(q2, q_backup.detach())
+        # q1_loss = ((q1 - q_backup.detach()).pow(2).squeeze(-1) * weights).mean()
+        # q2_loss = ((q2 - q_backup.detach()).pow(2).squeeze(-1) * weights).mean()
+        # 计算并写回td_error
+        # td_error = (q1.detach() - q_backup.detach()).abs().squeeze(-1) + 1e-6
+        # batch.set("td_error", td_error)
+        # # 更新优先级
+        # self.replay_buffer.update_tensordict_priority(batch)
         
-        self.qvalue2_optim.zero_grad()
-        q2_loss.backward()
-        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.qvalue1.parameters(), max_norm=5.)
-        self.qvalue2_optim.step()
-
-        
-        # Update actor - 重新前向传播获得新的actions
-        # fresh_batch_with_features = self.feature_extractor(batch)
-        # fresh_actions_td = self.actor(fresh_batch_with_features)
-        # fresh_actions = fresh_actions_td[("agents", "action_normalized")].squeeze(1)
-        # fresh_log_probs = fresh_actions_td.get("sample_log_prob", None)
-        
-            
-        # fresh_q_input = TensorDict({
-        #     "_feature": fresh_batch_with_features["_feature"].detach(),  # detach feature避免重复梯度
-        #     ("agents", "action_normalized"): fresh_actions,
-        # }, batch_size=batch.batch_size, device=self.device)
-        
-        # q1_new = self.qvalue1(fresh_q_input)["state_action_value_1"]
-        # q2_new = self.qvalue2(fresh_q_input)["state_action_value_2"]
-        # q_new = torch.min(q1_new, q2_new)
-        # q_new = self.q_norm.normalize(q_new)
-
-        # Update actor
-        
-        # Update alpha (temperature parameter)
-        if current_log_probs is not None:
+        # ===================== 4. 温度参数α更新 =====================
+        if actor_lp is not None:
             target_entropy = getattr(self.cfg, 'target_entropy', -self.action_dim)
-            alpha_loss = -(self.log_alpha * (current_log_probs.detach() + target_entropy)).mean()
-            self.alpha_optim.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optim.step()
-            # 使用detach来避免计算图问题
-            self.alpha = self.log_alpha.exp().detach()
+            alpha_loss = -(self.log_alpha * (actor_lp + target_entropy).detach()).mean()
         else:
             alpha_loss = torch.tensor(0.0, device=self.device)
         
-        # Soft update target networks
+        # ===================== 5. 执行所有更新 =====================
+
+
+        # 5.2 更新Q1网络
+        self.qvalue1_optim.zero_grad()
+        q1_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.qvalue1.parameters(), max_norm=5.0)
+        q1_grad_norm = self.calc_total_grad_norm(self.qvalue1.parameters()) 
+        self.qvalue1_optim.step()
+        
+        # 5.3 更新Q2网络
+        self.qvalue2_optim.zero_grad()
+        q2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.qvalue2.parameters(), max_norm=5.0)
+        q2_grad_norm = self.calc_total_grad_norm(self.qvalue2.parameters()) 
+        self.qvalue2_optim.step()
+        # 5.1 更新Actor和Feature Extractor
+        self.actor_optim.zero_grad()
+        actor_loss.backward()  
+        actor_grad_norm = self.calc_total_grad_norm(self.actor.parameters()) 
+        self.actor_optim.step()
+        
+        # 5.4 更新温度参数
+        self.alpha_optim.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optim.step()
+        self.alpha = self.log_alpha.exp()
+        
+        # ===================== 6. 软更新目标网络 =====================
         self._soft_update(self.qvalue1_target, self.qvalue1, tau)
         self._soft_update(self.qvalue2_target, self.qvalue2, tau)
         
@@ -344,17 +207,6 @@ class SAC(TensorDictModuleBase):
             "q2_loss": q2_loss,
             "alpha_loss": alpha_loss,
             "alpha": self.alpha,
-        }, []),TensorDict({
-            "reward_mean": rewards.mean(),
-            # "reward_max": rewards.max(),
-            # "reward_min": rewards.min(),
-            "q1_mean": current_q1.mean(),
-            "q2_mean": current_q2.mean(),
-            "target_q_mean": target_q.mean(),
-            "actor_loss_mean": actor_loss.mean(),
-            "q1_loss_mean": q1_loss.mean(),
-            "q2_loss_mean": q2_loss.mean(),
-            "alpha_loss_mean": alpha_loss.mean(),
         }, [])
     
     def _soft_update(self, target, source, tau):
@@ -364,6 +216,124 @@ class SAC(TensorDictModuleBase):
     
     def actions_to_world(self, actions, tensordict):
         """将动作从局部坐标系转换到世界坐标系"""
-        actions = (2*actions * self.cfg.actor.action_limit)-self.cfg.actor.action_limit
+        actions = actions * self.cfg.actor.action_limit
         actions_world = vec_to_world(actions,tensordict["agents", "observation", "direction"])
         return actions_world
+    # 再计算裁剪后的梯度范数
+    def calc_total_grad_norm(self,parameters):
+        total_norm = 0
+        for p in parameters:
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+
+    # def _compute_td_error(self, batch):
+    #     with torch.no_grad():
+    #         # 当前 Q 值
+    #         current_actions = batch[("agents", "action_normalized")]
+    #         current_q1_input = TensorDict({
+    #             "agents": batch["agents"],
+    #             ("agents", "action_normalized"): current_actions,
+    #         }, batch_size=batch.batch_size, device=self.device)
+    #         current_q1 = self.qvalue1(current_q1_input)["state_action_value"]
+
+    #         # 目标 Q 值
+    #         rewards = batch["next", "agents", "reward"]
+    #         dones = batch["next", "terminated"]
+    #         next_actions_td = self.actor(batch["next"])
+    #         next_actions = next_actions_td[("agents", "action_normalized")]
+    #         next_q_input = TensorDict({
+    #             "agents": batch["next", "agents"],
+    #             ("agents", "action_normalized"): next_actions,
+    #         }, batch_size=batch.batch_size, device=self.device)
+    #         next_q1 = self.qvalue1_target(next_q_input)["state_action_value"]
+    #         next_q2 = self.qvalue2_target(next_q_input)["state_action_value"]
+    #         next_q = torch.min(next_q1, next_q2)
+    #         target_q = rewards + self.gamma * (1 - dones.float()) * next_q
+
+    #         # 计算 TD-Error
+    #         td_error = target_q - current_q1
+    #     return td_error.abs()  # 返回绝对值作为优先级
+
+class ActorNetwork(nn.Module):
+    def __init__(self, action_dim, device):
+        super().__init__()
+        # lidar特征提取
+        feature_extractor_network = nn.Sequential(
+            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+            Rearrange("n c w h -> n (c w h)"),
+            nn.LazyLinear(128), nn.LayerNorm(128),
+        )
+        # 动态障碍特征提取
+        dynamic_obstacle_network = nn.Sequential(
+            Rearrange("n c w h -> n (c w h)"),
+            make_mlp([128, 64])
+        )
+        # 总特征拼接+MLP
+        self.feature_extractor = TensorDictSequential(
+            TensorDictModule(feature_extractor_network, [("observation", "lidar")], ["_cnn_feature"]),
+            TensorDictModule(dynamic_obstacle_network, [("observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
+            CatTensors(["_cnn_feature", ("observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
+            # TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+            TensorDictModule(nn.LayerNorm(200), ["_feature"], ["_feature"]),
+        ).to(device)
+        # 
+        self.actor = ProbabilisticActor(
+            TensorDictSequential(
+                TensorDictModule(make_mlp([256, 256]), in_keys=["_feature"], out_keys=["_feature_"]),
+                TensorDictModule(GaussianActor(action_dim), in_keys=["_feature_"], out_keys=["loc", "scale"])
+            ),
+            in_keys=["loc", "scale"],
+            out_keys=["action_normalized"], 
+            distribution_class=TanhNormal,
+            return_log_prob=True
+        ).to(device)
+
+    def forward(self, tensordict):
+        tensordict = self.feature_extractor(tensordict)
+        tensordict = self.actor(tensordict)
+        actor_lp = tensordict.get("sample_log_prob")
+        return tensordict, actor_lp
+
+class CriticNetwork(nn.Module):
+    def __init__(self, action_dim, device):
+        super().__init__()
+        # lidar特征提取
+        feature_extractor_network = nn.Sequential(
+            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+            Rearrange("n c w h -> n (c w h)"),
+            nn.LazyLinear(128), nn.LayerNorm(128),
+        )
+        # 动态障碍特征提取
+        dynamic_obstacle_network = nn.Sequential(
+            Rearrange("n c w h -> n (c w h)"),
+            make_mlp([128, 64])
+        )
+        # 总特征拼接+MLP
+        self.feature_extractor = TensorDictSequential(
+            TensorDictModule(feature_extractor_network, [("observation", "lidar")], ["_cnn_feature"]),
+            TensorDictModule(dynamic_obstacle_network, [("observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
+            CatTensors(["_cnn_feature", ("observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
+            # TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+            TensorDictModule(nn.LayerNorm(200), ["_feature"], ["_feature"]),
+        ).to(device)
+        
+        # Q网络
+        self.qvalue = TensorDictSequential(
+            CatTensors(["_feature", "action_normalized"], "_feature_action", del_keys=False),
+            TensorDictModule(
+                make_mlp([action_dim+256, action_dim+256, 1]),
+                # nn.Linear(action_dim+256, 1),
+                in_keys=["_feature_action"],
+                out_keys=["state_action_value"]
+            ),
+        ).to(device)
+    def forward(self, tensordict):
+        tensordict = self.feature_extractor(tensordict)
+        q = self.qvalue(tensordict)["state_action_value"]
+        return q

@@ -1,0 +1,322 @@
+'''
+Author: zdytim zdytim@foxmail.com
+Date: 2026-01-05 22:32:41
+LastEditors: zdytim zdytim@foxmail.com
+LastEditTime: 2026-01-05 22:32:44
+FilePath: /NavRL/isaac-training/training/scripts/wandb_model_utils.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+"""
+wandb 模型上传工具函数
+========================
+
+为现有的 NavRL 训练脚本提供 wandb 模型管理功能，
+无需大幅修改现有代码即可集成模型版本管理。
+"""
+
+import wandb
+import torch
+import os
+import tempfile
+from pathlib import Path
+from typing import Dict, Optional, Any
+
+
+def upload_model_to_wandb(model_state_dict: Dict[str, torch.Tensor], 
+                         step: int,
+                         eval_metrics: Optional[Dict] = None,
+                         model_alias: str = "latest",
+                         model_type: str = "checkpoint") -> None:
+    """
+    上传模型到 wandb artifacts
+    
+    Args:
+        model_state_dict: 模型状态字典
+        step: 训练步数
+        eval_metrics: 评估指标
+        model_alias: 模型别名 (e.g., "best", "latest")
+        model_type: 模型类型 (e.g., "checkpoint", "best", "final")
+    """
+    if not wandb.run:
+        print("⚠️  No active wandb run. Cannot upload model.")
+        return
+    
+    try:
+        # 创建临时文件保存模型
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
+            temp_path = f.name
+            torch.save(model_state_dict, temp_path)
+        
+        # 获取文件大小
+        file_size_mb = os.path.getsize(temp_path) / (1024**2)
+        
+        # 计算模型参数数量
+        total_params = sum(p.numel() for p in model_state_dict.values())
+        
+        # 创建 artifact
+        artifact_name = f"navrl-model-step-{step}"
+        artifact = wandb.Artifact(
+            name=artifact_name,
+            type="model",
+            metadata={
+                'step': step,
+                'architecture': 'PPO-ViT',
+                'total_parameters': total_params,
+                'file_size_mb': round(file_size_mb, 2),
+                'model_type': model_type,
+                'framework': 'NavRL',
+                **(eval_metrics or {})
+            }
+        )
+        
+        # 添加模型文件
+        artifact.add_file(temp_path, name="model.pt")
+        
+        # 创建模型卡片
+        model_card_content = create_model_card(step, total_params, file_size_mb, eval_metrics, model_type)
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write(model_card_content)
+            model_card_path = f.name
+        
+        artifact.add_file(model_card_path, name="model_card.md")
+        
+        # 上传 artifact
+        wandb.log_artifact(artifact, aliases=[model_alias])
+        
+        print(f"📤 Model uploaded to wandb:")
+        print(f"   🆔 Name: {artifact_name}")
+        print(f"   🏷️  Alias: {model_alias}")
+        print(f"   📊 Parameters: {total_params:,}")
+        print(f"   💾 Size: {file_size_mb:.2f} MB")
+        
+        # 清理临时文件
+        os.unlink(temp_path)
+        os.unlink(model_card_path)
+        
+    except Exception as e:
+        print(f"❌ Failed to upload model to wandb: {e}")
+
+
+def create_model_card(step: int, total_params: int, file_size_mb: float,
+                     eval_metrics: Optional[Dict] = None,
+                     model_type: str = "checkpoint") -> str:
+    """创建模型卡片内容"""
+    
+    content = f"""# NavRL Model - Step {step}
+
+## 🎯 Model Overview
+- **Type**: {model_type.title()}
+- **Architecture**: PPO-ViT with Shared Feature Extractor
+- **Training Step**: {step:,}
+- **Parameters**: {total_params:,}
+- **File Size**: {file_size_mb:.2f} MB
+
+## 📈 Performance Metrics
+"""
+    
+    if eval_metrics:
+        for key, value in eval_metrics.items():
+            if isinstance(value, (int, float)):
+                content += f"- **{key.replace('_', ' ').title()}**: {value:.4f}\n"
+            else:
+                content += f"- **{key.replace('_', ' ').title()}**: {value}\n"
+    else:
+        content += "- No evaluation metrics available\n"
+    
+    content += f"""
+## 🔧 Usage
+```python
+# Download and load model
+import wandb
+artifact = wandb.use_artifact('your-project/navrl-model-step-{step}:latest')
+artifact_dir = artifact.download()
+model_path = artifact_dir + "/model.pt"
+
+# Load model
+import torch
+state_dict = torch.load(model_path)
+model.load_state_dict(state_dict)
+```
+
+## 🏗️  Architecture Details
+- **Framework**: NavRL (PPO with ViT)
+- **Feature Extractor**: Vision Transformer with dynamic obstacle processing
+- **Actor Head**: Beta distribution policy network
+- **Critic Head**: Value function estimation
+- **Training**: Mixed precision with grouped learning rates
+
+Generated by NavRL training pipeline at step {step}
+"""
+    
+    return content
+
+
+def log_model_metrics(eval_metrics: Dict[str, Any], step: int) -> None:
+    """记录模型相关指标到 wandb"""
+    if not wandb.run:
+        return
+    
+    # 记录评估指标
+    for key, value in eval_metrics.items():
+        if isinstance(value, (int, float)):
+            wandb.log({f"model/{key}": value}, step=step)
+
+
+def create_model_comparison_table(models_info: List[Dict]) -> None:
+    """创建模型比较表格"""
+    if not wandb.run:
+        return
+    
+    try:
+        import pandas as pd
+        
+        # 创建 DataFrame
+        df = pd.DataFrame(models_info)
+        
+        # 创建 wandb 表格
+        table = wandb.Table(dataframe=df)
+        wandb.log({"model_comparison": table})
+        
+    except ImportError:
+        print("⚠️  pandas not available for model comparison table")
+
+
+def save_and_upload_best_model(model_state_dict: Dict[str, torch.Tensor],
+                               step: int,
+                               eval_metrics: Dict[str, Any],
+                               threshold_metric: str = "mean_reward",
+                               best_value_tracker: Dict = None) -> bool:
+    """
+    保存并上传最佳模型（基于指定指标）
+    
+    Args:
+        model_state_dict: 模型状态字典
+        step: 训练步数
+        eval_metrics: 评估指标
+        threshold_metric: 用于判断最佳模型的指标
+        best_value_tracker: 跟踪最佳值的字典
+        
+    Returns:
+        是否上传了新的最佳模型
+    """
+    if threshold_metric not in eval_metrics:
+        print(f"⚠️  Metric '{threshold_metric}' not found in eval_metrics")
+        return False
+    
+    current_value = eval_metrics[threshold_metric]
+    
+    # 初始化或更新最佳值跟踪
+    if best_value_tracker is None:
+        best_value_tracker = {'best_value': float('-inf'), 'best_step': 0}
+    
+    # 检查是否是新的最佳模型
+    if current_value > best_value_tracker['best_value']:
+        best_value_tracker['best_value'] = current_value
+        best_value_tracker['best_step'] = step
+        
+        print(f"🏆 New best model! {threshold_metric}: {current_value:.4f}")
+        
+        # 上传最佳模型
+        upload_model_to_wandb(
+            model_state_dict=model_state_dict,
+            step=step,
+            eval_metrics=eval_metrics,
+            model_alias="best",
+            model_type="best"
+        )
+        
+        # 记录最佳模型指标
+        wandb.log({
+            "best_model/step": step,
+            f"best_model/{threshold_metric}": current_value
+        }, step=step)
+        
+        return True
+    
+    return False
+
+
+def download_model_from_wandb(artifact_path: str, 
+                             download_dir: str = "./downloaded_models") -> Optional[str]:
+    """
+    从 wandb 下载模型
+    
+    Args:
+        artifact_path: wandb artifact 路径 (e.g., "username/project/model-name:version")
+        download_dir: 下载目录
+        
+    Returns:
+        下载的模型文件路径，失败时返回 None
+    """
+    try:
+        print(f"📥 Downloading model: {artifact_path}")
+        
+        # 下载 artifact
+        artifact = wandb.use_artifact(artifact_path)
+        artifact_dir = artifact.download(root=download_dir)
+        
+        # 寻找模型文件
+        model_files = list(Path(artifact_dir).glob("*.pt"))
+        if not model_files:
+            print("❌ No .pt model file found in artifact")
+            return None
+        
+        model_path = str(model_files[0])
+        print(f"✅ Model downloaded: {model_path}")
+        
+        # 打印 artifact 信息
+        if hasattr(artifact, 'metadata') and artifact.metadata:
+            print("📋 Model metadata:")
+            for key, value in artifact.metadata.items():
+                print(f"   {key}: {value}")
+        
+        return model_path
+        
+    except Exception as e:
+        print(f"❌ Failed to download model: {e}")
+        return None
+
+
+# === 使用示例函数 ===
+
+def integrate_wandb_to_existing_training():
+    """
+    将 wandb 模型管理集成到现有训练脚本的示例
+    """
+    print("""
+🔧 集成 wandb 模型管理到现有训练脚本：
+
+1. 导入工具函数：
+   from wandb_model_utils import upload_model_to_wandb, save_and_upload_best_model
+
+2. 在模型保存处添加上传：
+   # 原有保存代码
+   torch.save(policy.state_dict(), ckpt_path)
+   
+   # 添加 wandb 上传
+   upload_model_to_wandb(
+       model_state_dict=policy.state_dict(),
+       step=training_step,
+       model_alias="latest"
+   )
+
+3. 在评估后保存最佳模型：
+   eval_metrics = {"mean_reward": 85.2, "success_rate": 0.95}
+   save_and_upload_best_model(
+       model_state_dict=policy.state_dict(),
+       step=training_step,
+       eval_metrics=eval_metrics,
+       threshold_metric="mean_reward",
+       best_value_tracker=best_tracker  # 全局变量
+   )
+
+4. 从 wandb 恢复训练：
+   model_path = download_model_from_wandb("user/project/model:best")
+   if model_path:
+       policy.load_state_dict(torch.load(model_path))
+    """)
+
+
+if __name__ == "__main__":
+    integrate_wandb_to_existing_training()

@@ -6,7 +6,8 @@ import wandb
 import torch
 from omegaconf import DictConfig, OmegaConf
 from omni.isaac.kit import SimulationApp
-from SAC_v1 import SAC
+from SAC_lag import SAC
+# from SAC_v1 import SAC
 from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
@@ -20,7 +21,7 @@ import datetime
 os.environ["http_proxy"] = "http://127.0.0.1:7890"
 os.environ["https_proxy"] = "http://127.0.0.1:7890"
 
-FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
+FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "../cfg")
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
     # Simulation App
@@ -75,13 +76,15 @@ def main(cfg):
     # Replay buffer
     replay_buffer = TensorDictReplayBuffer(
         storage=LazyTensorStorage(max_size=cfg.algo.buffer_size),
-        batch_size=cfg.algo.batch_size if hasattr(cfg.algo, 'batch_size') else 256,
+        batch_size=cfg.algo.batch_size ,
     )
 
     # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
-    # checkpoint = "/home/u20/NavRL/isaac-training/training/scripts/wandb/offline-run-20250716_112035-mnnbcqxu/files/checkpoint_46000.pt"
+    # checkpoint = "/home/u20/NavRL/isaac-training/training/scripts/checkpoint_12000_lag.pt"
+    # check_dict = torch.load(checkpoint)
     # policy.load_state_dict(torch.load(checkpoint))
-    
+    # policy.critic1_cost1.load_state_dict({k.replace("critic1_cost1.", ""): v for k, v in check_dict.items() if k.startswith("critic1_cost1.")})
+
     # Episode Stats Collector
     episode_stats_keys = [
         k for k in transformed_env.observation_spec.keys(True, True) 
@@ -100,14 +103,15 @@ def main(cfg):
         exploration_type=ExplorationType.RANDOM,
     )
     
-
+    cost_lim = 5.5e-3
     # SAC specific variables
     update_counter = 0
-    warmup_steps = cfg.algo.warmup_steps if hasattr(cfg.algo, 'buffer_size') else 200_000
+    warmup_steps = cfg.algo.warmup_steps
     try:
     # Training Loop for SAC
         for i, data in enumerate(collector):
             # Add data to replay buffer
+            data = data.reshape(-1).cpu()  # Flatten to transition list
             replay_buffer.extend(data)
             
             # Log Info
@@ -116,7 +120,10 @@ def main(cfg):
             # Start training only after warmup
             if replay_buffer.__len__() >= warmup_steps:
                 # Train Policy with SAC
-                train_loss_stats = policy.train(replay_buffer,batch_size=cfg.algo.batch_size)
+                if i % 10000 == 0 and i > 0:
+                    cost_lim -= 1.5e-3
+                train_loss_stats = policy.train(replay_buffer,batch_size=cfg.algo.batch_size,cost_lim=cost_lim)
+                # train_loss_stats = policy.train(replay_buffer,batch_size=cfg.algo.batch_size)
                 # replay_buffer.update_priority(indices, td_error)
                 info.update(train_loss_stats)
                 update_counter += 1
@@ -157,7 +164,7 @@ def main(cfg):
             
             # Update wandb info
             run.log(info)
-            if i%100 ==0:
+            if i%20 ==0:
                 print(f"\n[Step {i}] SAC Training Summary:")
                 for k, v in info.items():
                     if isinstance(v, (float, int)):

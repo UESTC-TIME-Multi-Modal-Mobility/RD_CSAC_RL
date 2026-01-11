@@ -7,6 +7,11 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from omni.isaac.kit import SimulationApp
 from ppo import PPO
+# from SAC_v1 import SAC
+# from ppo_vit_v3 import PPOVIT
+from models.navrl_model import NavRLModel
+# from SAC_lag import SAC
+from models.sac_model import SACModelManager, SACModel
 from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
@@ -14,20 +19,22 @@ from torchrl.envs.transforms import TransformedEnv, Compose
 from utils import evaluate
 from torchrl.envs.utils import ExplorationType
 
+os.environ["http_proxy"] = "http://127.0.0.1:7890"
+os.environ["https_proxy"] = "http://127.0.0.1:7890"
 
-FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
-@hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
+FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "../cfg")
+@hydra.main(config_path=FILE_PATH, config_name="eval", version_base=None)
 def main(cfg):
     # Simulation App
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
-
+    wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     # Use Wandb to monitor training
     if (cfg.wandb.run_id is None):
         run = wandb.init(
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
+            # entity=cfg.wandb.entity,
+            config=wandb_config,
             mode=cfg.wandb.mode,
             id=wandb.util.generate_id(),
         )
@@ -35,8 +42,8 @@ def main(cfg):
         run = wandb.init(
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
+            # entity=cfg.wandb.entity,
+            config=wandb_config,
             mode=cfg.wandb.mode,
             id=cfg.wandb.run_id,
             resume="must"
@@ -53,12 +60,24 @@ def main(cfg):
     vel_transform = VelController(controller, yaw_control=False)
     transforms.append(vel_transform)
     transformed_env = TransformedEnv(env, Compose(*transforms)).train()
-    transformed_env.set_seed(cfg.seed)    
+    transformed_env.set_seed(cfg.seed)
     # PPO Policy
-    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
-
-    checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_final.pt"
-    policy.load_state_dict(torch.load(checkpoint))
+    # policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    # policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    # policy = SAC(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    print(f"[NavRL]: action_spec: {transformed_env.action_spec}")
+    policy = NavRLModel(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoint")
+    checkpoint_paths = [
+        os.path.join(checkpoint_dir, fname)
+        for fname in os.listdir(checkpoint_dir)
+        if fname.endswith(".pt")
+    ]
+    checkpoint_paths.sort()
+    if not checkpoint_paths:
+        raise FileNotFoundError(
+            f"No checkpoint files (*.pt) found in {checkpoint_dir}."
+        )
     
     # Episode Stats Collector
     episode_stats_keys = [
@@ -68,54 +87,41 @@ def main(cfg):
     episode_stats = EpisodeStats(episode_stats_keys)
 
     # RL Data Collector
-    collector = SyncDataCollector(
-        transformed_env,
-        policy=policy, 
-        frames_per_batch=cfg.env.num_envs * cfg.algo.training_frame_num, 
-        total_frames=cfg.max_frame_num,
-        device=cfg.device,
-        return_same_td=True, # update the return tensordict inplace (should set to false if we need to use replace buffer)
-        exploration_type=ExplorationType.RANDOM, # sample from normal distribution
-    )
 
-    # Training Loop
-    for i, data in enumerate(collector):
-        # print("data: ", data)
-        # print("============================")
-        # Log Info
-        info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+    eval_seed = cfg.seed
 
-        # # Train Policy
-        # train_loss_stats = policy.train(data)
-        # info.update(train_loss_stats) # log training loss info
+    # Evaluation Loop
+    for ckpt_path in checkpoint_paths:
+        ckpt_name = os.path.basename(ckpt_path)
+        print(f"[NavRL]: start evaluating policy from {ckpt_name} with seed {eval_seed}")
 
-        # # Calculate and log training episode stats
-        # episode_stats.add(data)
-        # if len(episode_stats) >= transformed_env.num_envs: # evaluate once if all agents finished one episode
-        #     stats = {
-        #         "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
-        #         for k, v in episode_stats.pop().items(True, True)
-        #     }
-        #     info.update(stats)
+        state_dict = torch.load(ckpt_path, map_location=cfg.device)
+        policy.load_state_dict(state_dict)
 
-        # Evaluate policy and log info
-        # if i % cfg.eval_interval == 0:
-        print("[NavRL]: start evaluating policy at training step: ", i)
+        info = {
+            "env_seed": eval_seed,
+            "checkpoint": ckpt_name,
+        }
+        env.enable_render(True)
         env.eval()
+        transformed_env.set_seed(eval_seed)
         eval_info = evaluate(
-            env=transformed_env, 
+            env=transformed_env,
             policy=policy,
-            seed=cfg.seed, 
+            seed=eval_seed,
             cfg=cfg,
-            exploration_type=ExplorationType.MEAN
+            exploration_type=ExplorationType.MEAN,
         )
+        env.enable_render(not cfg.headless)
         env.train()
         env.reset()
         info.update(eval_info)
+
         print("\n[NavRL]: evaluation done.")
-        
-        # Update wand info
+
+        # Update wandb info
         run.log(info)
+        print(f"[NavRL]: eval info: {info}")
 
 
         # # Save Model

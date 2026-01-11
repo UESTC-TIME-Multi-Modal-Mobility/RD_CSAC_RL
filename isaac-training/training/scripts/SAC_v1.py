@@ -9,6 +9,11 @@ from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
 from torchrl.modules.distributions import TanhNormal
 from copy import deepcopy
+
+# 导入新的模型管理器
+from models.sac_model import SACModelManager, SACModel, ActorNetwork as SACActorNetwork, CriticNetwork as SACCriticNetwork
+
+# 为了向后兼容，保留原有的类定义（标记为废弃）
 class ActorNetwork(nn.Module):
     def __init__(self, obs_dim, action_dim, device):
         super().__init__()
@@ -144,7 +149,7 @@ class SAC(TensorDictModuleBase):
         self.critic1_target = deepcopy(self.critic1)
         self.critic2_target = deepcopy(self.critic2)
         #Initialize Temperature parameter
-        self.log_alpha = nn.Parameter(torch.log(torch.tensor(1, device=device)))
+        self.log_alpha = nn.Parameter(torch.log(torch.tensor(5, device=device)))
         self.alpha = self.log_alpha.exp().detach()
         self.target_entropy = -float(self.act_dim)
         
@@ -156,7 +161,7 @@ class SAC(TensorDictModuleBase):
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
         self.critic1_optim = torch.optim.Adam(self.critic1.parameters(), lr=cfg.critic.learning_rate)
         self.critic2_optim = torch.optim.Adam(self.critic2.parameters(), lr=cfg.critic.learning_rate)
-        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=getattr(cfg, 'alpha_learning_rate', 5e-4))
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate)
 
 
         def init_(module):
@@ -190,117 +195,119 @@ class SAC(TensorDictModuleBase):
         td["agents","action"] = actions_world
         td["agents","action_normalized"] = action_n
         return td
-    def train(self, replay_buffer, batch_size=256, tau=0.005):
+    def train(self,replay_buffer, batch_size, tau=0.005):
         """SAC training step with improved stability"""
-            
+        train_tds = []
         # Sample batch
-        batch = replay_buffer.sample(batch_size).to(self.device).squeeze(1)
-
-        states = batch['agents','observation'].squeeze(-1).to(self.device)
-        actions = batch['agents','action_normalized'].to(self.device)  # Normalize actions
-        rewards = batch['next', 'agents','reward'].squeeze(1).to(self.device)
-        next_states = batch['next', 'agents','observation'].squeeze(-1).to(self.device)
-        # dones = (
-        #     batch['next', 'terminated'].squeeze(-1).to(torch.bool)
-        #     | batch['next', 'truncated'].squeeze(-1).to(torch.bool)
-        # ).float().to(self.device)
-        dones = batch['next', 'terminated'].squeeze(-1).to(torch.bool).float().to(self.device)
-        # ============ Update Critics ============
-        with torch.no_grad():
-            # Sample next actions using current policy
-            _ ,next_mu, next_log_std = self.actor(next_states)
-            next_std = next_log_std.exp().clamp(min=1e-6)
-            next_normal = torch.distributions.Normal(next_mu, next_std)
-            next_x_t = next_normal.rsample()
-            next_actions = torch.tanh(next_x_t)
+        for _ in range(self.cfg.num_minibatches):
+            batch = replay_buffer.sample(batch_size).to(self.device)
+            states = batch['agents','observation'].squeeze(-1).to(self.device)
+            actions = batch['agents','action_normalized'].to(self.device)  # Normalize actions
+            rewards = batch['next', 'agents','reward'].squeeze(1).to(self.device)
+            next_states = batch['next', 'agents','observation'].squeeze(-1).to(self.device)
+            # dones = (
+            #     batch['next', 'terminated'].squeeze(-1).to(torch.bool)
+            #     | batch['next', 'truncated'].squeeze(-1).to(torch.bool)
+            # ).float().to(self.device)
+            dones = batch['next', 'terminated'].squeeze(-1).to(torch.bool).float().to(self.device)
+            # ============ Update Critics ============
+            with torch.no_grad():
+                # Sample next actions using current policy
+                _ ,next_mu, next_log_std = self.actor(next_states)
+                next_std = next_log_std.exp().clamp(min=1e-6)
+                next_normal = torch.distributions.Normal(next_mu, next_std)
+                next_x_t = next_normal.rsample()
+                next_actions = torch.tanh(next_x_t)
+                
+                # Calculate log probabilities with correction for tanh
+                next_log_probs = next_normal.log_prob(next_x_t) - torch.log(1 - next_actions.pow(2) + 1e-6)
+                next_log_probs = next_log_probs.sum(-1)
+                
+                # Target Q values
+                next_q1 = self.critic1_target(next_states, next_actions).squeeze(-1)
+                next_q2 = self.critic2_target(next_states, next_actions).squeeze(-1)
+                next_q = torch.min(next_q1, next_q2)
+                
+                # Compute target with entropy regularization
+                target_q = rewards + self.gamma * (1 - dones) * (next_q - self.alpha * next_log_probs)
             
-            # Calculate log probabilities with correction for tanh
-            next_log_probs = next_normal.log_prob(next_x_t) - torch.log(1 - next_actions.pow(2) + 1e-6)
-            next_log_probs = next_log_probs.sum(-1)
+            # Current Q values
+            q1 = self.critic1(states, actions).squeeze(-1)
+            q2 = self.critic2(states, actions).squeeze(-1)
             
-            # Target Q values
-            next_q1 = self.critic1_target(next_states, next_actions).squeeze(-1)
-            next_q2 = self.critic2_target(next_states, next_actions).squeeze(-1)
-            next_q = torch.min(next_q1, next_q2)
+            # Critic losses
+            critic1_loss = F.mse_loss(q1, target_q)
+            critic2_loss = F.mse_loss(q2, target_q)
             
-            # Compute target with entropy regularization
-            target_q = rewards + self.gamma * (1 - dones) * (next_q - self.alpha * next_log_probs)
-        
-        # Current Q values
-        q1 = self.critic1(states, actions).squeeze(-1)
-        q2 = self.critic2(states, actions).squeeze(-1)
-        
-        # Critic losses
-        critic1_loss = F.mse_loss(q1, target_q)
-        critic2_loss = F.mse_loss(q2, target_q)
-        
-        # Update critics
-        self.critic1_optim.zero_grad()
-        critic1_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 1.0)  # Gradient clipping
-        self.critic1_optim.step()
-        
-        self.critic2_optim.zero_grad()
-        critic2_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 1.0)  # Gradient clipping
-        self.critic2_optim.step()
-        
-        # ============ Update Actor ============
-        # Resample actions for actor update
-        _ ,mu, log_std = self.actor(states)
-        std = log_std.exp().clamp(min=1e-6)
-        normal = torch.distributions.Normal(mu, std)
-        x_t = normal.rsample()
-        actions_new = torch.tanh(x_t)
-        
-        # Calculate log probabilities
-        log_probs = normal.log_prob(x_t) - torch.log(1 - actions_new.pow(2) + 1e-6)
-        log_probs = log_probs.sum(-1)
-        
-        # Q values for new actions
-        q1_new = self.critic1(states, actions_new).squeeze(-1)
-        q2_new = self.critic2(states, actions_new).squeeze(-1)
-        q_min = torch.min(q1_new, q2_new)
-        
-        # Actor loss
-        actor_loss = (self.alpha * log_probs - q_min).mean()
-        
-        # Update actor
-        self.actor_optim.zero_grad()
-        actor_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # Gradient clipping
-        self.actor_optim.step()
-        
-        # ============ Update Temperature ============
+            # Update critics
+            self.critic1_optim.zero_grad()
+            critic1_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 1.0)  # Gradient clipping
+            self.critic1_optim.step()
+            
+            self.critic2_optim.zero_grad()
+            critic2_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 1.0)  # Gradient clipping
+            self.critic2_optim.step()
+            
+            # ============ Update Actor ============
+            # Resample actions for actor update
+            _ ,mu, log_std = self.actor(states)
+            std = log_std.exp().clamp(min=1e-6)
+            normal = torch.distributions.Normal(mu, std)
+            x_t = normal.rsample()
+            actions_new = torch.tanh(x_t)
+            
+            # Calculate log probabilities
+            log_probs = normal.log_prob(x_t) - torch.log(1 - actions_new.pow(2) + 1e-6)
+            log_probs = log_probs.sum(-1)
+            
+            # Q values for new actions
+            q1_new = self.critic1(states, actions_new).squeeze(-1)
+            q2_new = self.critic2(states, actions_new).squeeze(-1)
+            q_min = torch.min(q1_new, q2_new)
+            
+            # Actor loss
+            actor_loss = (self.alpha * log_probs - q_min).mean()
+            
+            # Update actor
+            self.actor_optim.zero_grad()
+            actor_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # Gradient clipping
+            self.actor_optim.step()
+            
+            # ============ Update Temperature ============
 
-        alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
-        
-        # Update temperature
-        self.alpha_optim.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optim.step()
-        self.alpha = self.log_alpha.exp()
-        
-        # ============ Soft Update Target Networks ============
-        self._soft_update(self.critic1_target, self.critic1, tau)
-        self._soft_update(self.critic2_target, self.critic2, tau)
-        
+            alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+            
+            # Update temperature
+            self.alpha_optim.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optim.step()
+            self.alpha = self.log_alpha.exp()
+            
+            # ============ Soft Update Target Networks ============
+            self._soft_update(self.critic1_target, self.critic1, tau)
+            self._soft_update(self.critic2_target, self.critic2, tau)
+            
 
-        train_td =  TensorDict({
-            "actor_loss": actor_loss.item(),
-            "q1_loss": critic1_loss.item(),
-            "q2_loss": critic2_loss.item(),
-            "alpha_loss": alpha_loss.item(),
-            "alpha": self.alpha.item(),
-            "actor_lp": log_probs.mean(),
-            "q1": q1.mean(),
-            "q_min": q_min.mean(),
-            "q1_new": q1_new.mean(),
-            "td_error": (q1_new - target_q).mean(),
-            "td_error_target": (q1 - target_q).mean(),
-        }, [])
-        train_td = train_td.apply(torch.mean,batch_size=[])
-        return {k: v.mean().item() for k, v in train_td.items()}
+            train_td =  TensorDict({
+                "actor_loss": actor_loss.item(),
+                "q1_loss": critic1_loss.item(),
+                "q2_loss": critic2_loss.item(),
+                "alpha_loss": alpha_loss.item(),
+                "alpha": self.alpha.item(),
+                "actor_lp": log_probs.mean(),
+                "q1": q1.mean(),
+                "q_min": q_min.mean(),
+                "q1_new": q1_new.mean(),
+                "td_error": (q1_new - target_q).mean(),
+                "td_error_target": (q1 - target_q).mean(),
+            }, [])
+            train_tds.append(train_td)
+        loss_infos = torch.stack(train_tds).to_tensordict()
+        loss_infos = loss_infos.apply(torch.mean, batch_size=[])
+        return {k: v.mean().item() for k, v in loss_infos.items()}
     def actions_to_world(self, actions, tensordict):
         """将动作从局部坐标系转换到世界坐标系"""
         actions = actions * self.cfg.actor.action_limit
@@ -309,3 +316,67 @@ class SAC(TensorDictModuleBase):
     def _soft_update(self, target, source, tau):
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
+
+
+# ============================================================================
+# 新版本：使用模型管理器的 SAC（推荐使用）
+# ============================================================================
+
+class SAC_V2(TensorDictModuleBase):
+    """
+    SAC V2 版本 - 使用 SACModelManager
+    
+    这是一个包装类，将训练逻辑委托给 SACModelManager
+    提供与原始 SAC 相同的接口以保持兼容性
+    """
+    
+    def __init__(self, cfg, observation_spec, action_spec, device):
+        super().__init__()
+        # 使用模型管理器
+        self.manager = SACModelManager(cfg, observation_spec, action_spec, device)
+        self.cfg = cfg
+        self.device = device
+        
+        # 暴露模型的主要组件以保持向后兼容
+        self.actor = self.manager.model.actor
+        self.critic1 = self.manager.model.critic1
+        self.critic2 = self.manager.model.critic2
+        self.critic1_target = self.manager.model.critic1_target
+        self.critic2_target = self.manager.model.critic2_target
+        self.log_alpha = self.manager.model.log_alpha
+        self.alpha = self.manager.model.alpha
+        self.target_entropy = self.manager.model.target_entropy
+        self.gamma = self.manager.model.gamma
+        self.action_limit = self.manager.model.action_limit
+        
+        # 暴露优化器
+        self.actor_optim = self.manager.model.actor_optim
+        self.critic1_optim = self.manager.model.critic1_optim
+        self.critic2_optim = self.manager.model.critic2_optim
+        self.alpha_optim = self.manager.model.alpha_optim
+        
+        print(f"✅ SAC_V2 initialized (using SACModelManager)")
+    
+    def get_action(self, state, deterministic=True):
+        """获取动作"""
+        return self.manager.get_action(state, deterministic)
+    
+    def __call__(self, td):
+        """环境交互"""
+        return self.manager(td)
+    
+    def train(self, replay_buffer, batch_size, tau=0.005):
+        """训练步骤"""
+        return self.manager.train_step(replay_buffer, batch_size, tau)
+    
+    def save_checkpoint(self, path, step, **extra_info):
+        """保存检查点"""
+        self.manager.save_checkpoint(path, step, **extra_info)
+    
+    def load_checkpoint(self, path, load_optimizers=True):
+        """加载检查点"""
+        return self.manager.load_checkpoint(path, load_optimizers)
+    
+    def actions_to_world(self, actions, tensordict):
+        """将动作从局部坐标系转换到世界坐标系"""
+        return self.manager.model.actions_to_world(actions, tensordict)

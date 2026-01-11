@@ -2,7 +2,7 @@
 Author: zdytim zdytim@foxmail.com
 Date: 2025-07-07 22:47:24
 LastEditors: zdytim zdytim@foxmail.com
-LastEditTime: 2025-07-07 22:47:26
+LastEditTime: 2026-01-06 15:04:26
 FilePath: /u20/NavRL/isaac-training/training/scripts/ViTsubmodules.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''

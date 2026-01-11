@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import wandb
 import numpy as np
+import pandas as pd
 from typing import Iterable, Union
 from tensordict.tensordict import TensorDict
 from omni_drones.utils.torchrl import RenderCallback
@@ -115,9 +116,29 @@ class BetaActor(nn.Module):
     def forward(self, features: torch.Tensor):
         alpha = 1. + self.alpha_softplus(self.alpha_layer(features)) + 1e-6
         beta = 1. + self.beta_softplus(self.beta_layer(features)) + 1e-6
+        MAX_BETA_PARAM = 20.0  # 或者10.0，根据实际情况调整
+        alpha = torch.clamp(alpha, min=1.0001, max=MAX_BETA_PARAM)
+        beta = torch.clamp(beta, min=1.0001, max=MAX_BETA_PARAM)
         # print("alpha: ", alpha)
         # print("beta: ", beta)
         return alpha, beta
+
+
+class GaussianActor(nn.Module):
+    def __init__(self, action_dim: int) -> None:
+        super().__init__()
+        self.mean_layer = nn.Linear(256, action_dim)
+        # 使用形状为 (1, action_dim) 的参数，便于在 forward 时按 batch 扩展
+        self.log_std_param = nn.Parameter(torch.zeros(1, action_dim))
+
+    def forward(self, features: torch.Tensor):
+        # features: [B, 256]（或兼容形状）
+        loc = self.mean_layer(features)  # [B, action_dim]
+        # clamp 防止 log_std 漂移到极端值
+        log_std = self.log_std_param.clamp(-20.0, 2.0)
+        # 按 batch 扩展到与 loc 匹配的 shape
+        log_std = log_std.expand_as(loc)  # [B, action_dim]
+        return loc, log_std
 
 class GAE(nn.Module):
     def __init__(self, gamma, lmbda):
@@ -149,11 +170,24 @@ class GAE(nn.Module):
         return advantages, returns
 
 def make_batch(tensordict: TensorDict, num_minibatches: int):
-    tensordict = tensordict.reshape(-1) 
-    perm = torch.randperm(
-        (tensordict.shape[0] // num_minibatches) * num_minibatches,
-        device=tensordict.device,
-    ).reshape(num_minibatches, -1)
+    tensordict = tensordict.reshape(-1)
+    total_samples = tensordict.shape[0]
+    
+    # 确保至少有足够的样本来创建minibatches
+    if total_samples < num_minibatches:
+        print(f"Warning: total_samples ({total_samples}) < num_minibatches ({num_minibatches}), adjusting to {total_samples}")
+        num_minibatches = max(1, total_samples)
+    
+    # 调整样本数量以确保可以整除
+    samples_per_batch = total_samples // num_minibatches
+    if samples_per_batch == 0:
+        # 如果每个批次都没有样本，返回整个数据集作为单个批次
+        yield tensordict
+        return
+        
+    usable_samples = samples_per_batch * num_minibatches
+    
+    perm = torch.randperm(usable_samples, device=tensordict.device).reshape(num_minibatches, -1)
     for indices in perm:
         yield tensordict[indices]
 
@@ -166,23 +200,25 @@ def evaluate(
     exploration_type: ExplorationType=ExplorationType.MEAN
 ):
 
+    # 禁用渲染以节省显存，只收集数据
     env.enable_render(True)
     env.eval()
     env.set_seed(seed)
 
+    # 禁用视频录制以节省显存
     render_callback = RenderCallback(interval=2)
     
     with set_exploration_type(exploration_type):
         trajs = env.rollout(
             max_steps=env.max_episode_length,
             policy=policy,
-            callback=render_callback,
+            callback=render_callback,  # 禁用视频录制
             auto_reset=True,
             break_when_any_done=False,
             return_contiguous=False,
         )
     # base_env.enable_render(not cfg.headless)
-    env.enable_render(not cfg.headless)
+    env.enable_render(not cfg.headless)  # 保持渲染关闭状态
     env.reset()
     
     done = trajs.get(("next", "done")) 
@@ -202,12 +238,13 @@ def evaluate(
         for k, v in traj_stats.items()
     }
 
-    # log video
+    # 禁用视频录制以节省显存
     info["recording"] = wandb.Video(
         render_callback.get_video_array(axes="t c h w"), 
         fps=0.5 / (cfg.sim.dt * cfg.sim.substeps), 
         format="mp4"
     )
+    
     env.train()
     # env.reset()
 

@@ -19,15 +19,15 @@ class PPO(TensorDictModuleBase):
 
         # self.scaler = GradScaler()
         # Feature extractor for LiDAR()
-        # feature_extractor_network = nn.Sequential(
-        #     nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
-        #     nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
-        #     nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
-        #     Rearrange("n c w h -> n (c w h)"),
-        #     nn.LazyLinear(128), nn.LayerNorm(128),
-        # ).to(self.device)
+        feature_extractor_network = nn.Sequential(
+            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
+            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+            Rearrange("n c w h -> n (c w h)"),
+            nn.LazyLinear(128), nn.LayerNorm(128),
+        ).to(self.device)
         
-        feature_extractor_network = ViT().to(self.device)  # Use ViT as the feature extractor
+        # feature_extractor_network = ViT().to(self.device)  # Use ViT as the feature extractor
         # feature_extractor_network = ConvNet().to(self.device)  # Use ViT as the feature extractor
         # Dynamic obstacle information extractor
         dynamic_obstacle_network = nn.Sequential(
@@ -130,15 +130,17 @@ class PPO(TensorDictModuleBase):
 
         # Training
         infos = []
+        # rewards_infos = []
         for epoch in range(self.cfg.training_epoch_num):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
             for minibatch in batch:
                 # with autocast():
                 infos.append(self._update(minibatch))       
         infos = torch.stack(infos).to_tensordict()
-        
+        # rewards_infos.append(rewards.mean())
+        # rewards_infos = torch.stack(rewards_infos).to_tensordict()
         infos = infos.apply(torch.mean, batch_size=[])
-        return {k: v.item() for k, v in infos.items()}    
+        return {k: v.item() for k, v in infos.items()}
 
     
     def _update(self, tensordict): # tensordict shape (batch_size, )
