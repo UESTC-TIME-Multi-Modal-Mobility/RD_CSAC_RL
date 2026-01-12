@@ -82,7 +82,7 @@ install_orbit_extension() {
     if [ -f "$1/setup.py" ];
     then
         echo -e "\t module: $1"
-        ${python_exe} -m pip install --editable $1
+        ${python_exe} -m pip install --no-build-isolation --editable $1
     fi
 }
 

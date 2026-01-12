@@ -10,7 +10,7 @@ from ppo import PPO
 # from SAC_v1 import SAC
 # from ppo_vit_v3 import PPOVIT
 from models.navrl_model import NavRLModel
-# from SAC_lag import SAC
+from SAC_lag import SAC
 from models.sac_model import SACModelManager, SACModel
 from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
@@ -64,7 +64,7 @@ def main(cfg):
     # PPO Policy
     # policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
     # policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
-    # policy = SAC(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    #policy = SAC(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
     print(f"[NavRL]: action_spec: {transformed_env.action_spec}")
     policy = NavRLModel(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
     checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoint")
@@ -97,7 +97,6 @@ def main(cfg):
 
         state_dict = torch.load(ckpt_path, map_location=cfg.device)
         policy.load_state_dict(state_dict)
-
         info = {
             "env_seed": eval_seed,
             "checkpoint": ckpt_name,
