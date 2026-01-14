@@ -1,0 +1,116 @@
+# wandb 模型管理配置示例
+# ==============================
+
+# === 基础 wandb 配置 ===
+wandb:
+  project: "navrl-models"           # wandb 项目名称
+  name: "ppo-vit-experiment"        # 实验名称
+  mode: "online"                    # "online", "offline", "disabled"
+  entity: "your-username"           # wandb 用户名或团队名 (可选)
+  run_id: null                      # 恢复特定运行时使用 (可选)
+  tags: ["ppo", "vit", "navigation", "v1.0"]  # 运行标签 (可选)
+
+# === 模型管理配置 ===
+model_management:
+  upload_frequency: 5               # 每N次保存上传一次模型到wandb
+  save_best_models: true            # 是否自动保存最佳模型
+  best_model_metric: "mean_reward"  # 判断最佳模型的指标
+  auto_model_registry: true         # 是否自动上传到模型注册表
+  
+  # 模型版本别名配置
+  version_aliases:
+    - "latest"                      # 最新版本
+    - "best"                        # 最佳版本
+    - "stable"                      # 稳定版本
+  
+  # 模型上传条件
+  upload_conditions:
+    min_reward_threshold: 50.0      # 最小奖励阈值
+    min_success_rate: 0.7           # 最小成功率
+    upload_final_model: true        # 是否上传最终模型
+
+# === 评估配置 ===
+evaluation:
+  eval_interval: 100                # 评估间隔 (训练步数)
+  num_eval_episodes: 10             # 每次评估的回合数
+  max_episode_length: 1000          # 最大回合长度
+  success_reward_threshold: 50.0    # 成功判定的奖励阈值
+  
+  # 评估指标配置
+  metrics:
+    - "mean_reward"                 # 平均奖励
+    - "success_rate"                # 成功率
+    - "episode_length"              # 回合长度
+    - "collision_rate"              # 碰撞率 (如果适用)
+
+# === 模型恢复配置 ===
+# 从 wandb artifact 恢复 (优先级高)
+# resume_checkpoint: "username/navrl-models/navrl-model-step-5000:best"
+
+# 从本地文件恢复
+# resume_checkpoint: "outputs/checkpoint_5000.pt"
+
+# === 训练配置 ===
+training:
+  total_training_steps: 20000       # 总训练步数
+  save_interval: 200                # 保存间隔
+  log_interval: 50                  # 日志记录间隔
+  
+  # 检查点保存配置
+  checkpoint:
+    save_locally: true              # 是否本地保存
+    local_save_dir: "checkpoints"   # 本地保存目录
+    keep_last_n: 5                  # 保留最近N个本地检查点
+    
+# === 设备和性能配置 ===
+device: "cuda:0"                   # 训练设备
+use_amp: true                      # 混合精度训练
+
+# === 环境配置 ===
+env:
+  num_envs: 64                     # 并行环境数量
+  max_episode_steps: 1000          # 环境最大步数
+
+# === PPO 配置 ===
+actor:
+  learning_rate: 3e-4              # 学习率
+  clip_ratio: 0.2                  # PPO 裁剪比例
+
+critic:
+  learning_rate: 3e-4              # 评论家学习率
+  clip_ratio: 0.2                  # 价值函数裁剪比例
+
+# === ViT 特征提取器配置 ===
+feature_extractor:
+  pretrained_checkpoint_path: "path/to/vit_weights.pth"  # 预训练权重路径
+  freeze_encoder: true             # 是否冻结编码器
+  decoder_learning_rate_scale: 0.1 # 解码器学习率缩放
+
+# === 数据收集配置 ===
+frames_per_batch: 2048             # 每批次帧数
+total_frames: 1000000               # 总帧数
+
+# === 高级 wandb 功能配置 ===
+advanced_logging:
+  log_gradients: false              # 是否记录梯度
+  log_model_topology: true          # 是否记录模型结构
+  log_system_metrics: true          # 是否记录系统指标
+  
+  # 自定义指标
+  custom_metrics:
+    exploration_rate: true          # 探索率
+    action_entropy: true            # 动作熵
+    value_loss: true                # 价值损失
+  
+  # 媒体日志
+  media_logging:
+    log_videos: false               # 是否记录视频
+    video_frequency: 1000           # 视频记录频率
+    log_images: true                # 是否记录图像
+    image_frequency: 500            # 图像记录频率
+
+# === 错误处理和重试配置 ===
+error_handling:
+  wandb_retry_attempts: 3           # wandb 上传重试次数
+  retry_delay: 5                    # 重试延迟 (秒)
+  continue_on_upload_failure: true  # 上传失败时是否继续训练

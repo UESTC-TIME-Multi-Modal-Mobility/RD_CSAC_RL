@@ -1,42 +1,19 @@
 algo:
   feature_extractor:
-    learning_rate: 1e-4
+    learning_rate: 5e-4
     dyn_obs_num: 5
-  
+    pretrained_checkpoint_path: "/home/u20/NavRL/isaac-training/training/scripts/ViTLSTM_model.pth"
+
   actor:
-    learning_rate: 1e-5
+    learning_rate: 5e-4
     clip_ratio: 0.1
     action_limit: 2.0 # m/s
-  
+
   critic:
-    learning_rate: 1e-4
+    learning_rate: 5e-4
     clip_ratio: 0.1
-  
+
   entropy_loss_coefficient: 1e-3 # encourage exploration
-  training_frame_num: 32   #每环境32帧
-  training_epoch_num: 4
-  num_minibatches: 16 # split into N minibatches
-  buffer_size: 16e4
-  warmup_steps: 500
-  eval_interval: 1000
-
-  # network
-  network:
-    hidden_sizes: [256, 256]
-    activation: relu
-    default_policy_scale: 1.0
-    scale_lb: 0.1
-    device: cuda:0
-
-  # optim
-  optim:
-    utd_ratio: 1.0
-    gamma: 0.1
-    loss_function: l2
-    lr: 3.0e-4
-    weight_decay: 0.0
-    batch_size: 512
-    target_update_polyak: 0.995
-    alpha_init: 1.0
-    adam_eps: 1.0e-8
-  
+  training_frame_num: 64
+  training_epoch_num: 2
+  # num_minibatches: 4 # split into N minibatches

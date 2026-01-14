@@ -1,0 +1,32 @@
+algo:
+  feature_extractor:
+    learning_rate: 1e-4
+    dyn_obs_num: 5
+  actor:
+    learning_rate: 5e-4
+
+    action_limit: 2.0 # m/s
+  critic:
+    learning_rate: 5e-4
+  critic_cost:
+    learning_rate: 1e-3
+  training_frame_num: 16   #每环境32帧
+  training_epoch_num: 5
+  num_minibatches: 16 # split into N minibatches
+  buffer_size: 2e5
+  warmup_steps: 300
+  lambda_learning_rate: 1e-5
+  eval_interval: 1000
+  batch_size: 256
+  alpha_learning_rate: 1e-5
+  entropic_index: 0.5
+
+  # network
+  network:
+    hidden_sizes: [256, 256]
+    activation: relu
+    default_policy_scale: 1.0
+    scale_lb: 0.1
+    device: cuda:0
+
+

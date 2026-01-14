@@ -4,13 +4,13 @@ defaults:
   - sac
   - sim
 
-headless: True
+headless: False
 device: "cuda:0"
 seed: 0
 
 # Total Training Length
-max_frame_num: 12e8 # max frame 
-eval_interval: 70000 # evaluate the policy for every N training steps
+max_frame_num: 12e8 # max frame
+eval_interval: 1000 # evaluate the policy for every N training steps
 save_interval: 1000
 # collector
 collector:
@@ -23,7 +23,7 @@ collector:
 # Training Environment
 env:
   num_envs: 8 # Number of drones for training
-  max_episode_length: 2200
+  max_episode_length: 3000
   env_spacing: 8.0
   num_obstacles: 100
   max_episode_steps: 1000
@@ -39,11 +39,11 @@ viewer:
   resolution: [960, 720]
 
 wandb:
-  project: NavRL
+  project: NavRL_eval
   name: zdytim-uestc
   # entity: CERLAB-UAV-RL-Navigation
-  # mode: offline # online
-  mode: online
+  mode: offline # online
+  # mode: online
   run: True
   id: 2
   key: #836b25ad1ef4b0832c55eb637d418e6d
@@ -60,7 +60,7 @@ network:
 # optim
 optim:
   utd_ratio: 1.0
-  gamma: 0.99
+  gamma: 0.95
   loss_function: l2
   lr: 3.0e-4
   weight_decay: 0.0
@@ -69,18 +69,12 @@ optim:
   alpha_init: 1.0
   adam_eps: 1.0e-8
 
-# replay buffer
-replay_buffer:
-  size: 10000
-  prb: 0 # use prioritized experience replay
-  scratch_dir:
-
 compile:
   compile: False
   compile_mode:
   cudagraphs: False
 
-training_frame_num: 32   #每环境64帧
+training_frame_num: 32 #每环境32帧
 training_epoch_num: 5
 num_minibatches: 16 # split into N minibatches
-alpha_learning_rate: 1e-5 # coefficient for learning alpha
+alpha_learning_rate: 1e-3 # coefficient for learning alpha
