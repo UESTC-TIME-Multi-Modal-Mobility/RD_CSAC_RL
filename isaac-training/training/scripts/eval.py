@@ -23,7 +23,8 @@ os.environ["http_proxy"] = "http://127.0.0.1:7890"
 os.environ["https_proxy"] = "http://127.0.0.1:7890"
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "../cfg")
-@hydra.main(config_path=FILE_PATH, config_name="eval", version_base=None)
+#@hydra.main(config_path=FILE_PATH, config_name="eval", version_base=None) cfg路径修改
+@hydra.main(config_path="../cfg", config_name="eval", version_base=None)
 def main(cfg):
     # Simulation App
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})

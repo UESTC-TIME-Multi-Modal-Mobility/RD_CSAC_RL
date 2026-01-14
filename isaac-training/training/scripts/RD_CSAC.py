@@ -1,401 +1,384 @@
-import argparse
-import os
-import hydra
-import datetime
-import wandb
+'''
+Author: zdytim zdytim@foxmail.com
+Date: 2025-08-28 13:41:23
+LastEditors: zdytim zdytim@foxmail.com
+LastEditTime: 2026-01-06 23:17:53
+FilePath: /u20/NavRL/isaac-training/training/scripts/SAC_lag.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tensordict.tensordict import TensorDict
-from omegaconf import DictConfig, OmegaConf
-from omni.isaac.kit import SimulationApp
-from SAC_lag import SAC
-from models.navrl_model import NavRLModel
-from omni_drones.controllers import LeePositionController
-from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
-from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
-from torchrl.envs.transforms import TransformedEnv, Compose
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
-from utils import evaluate
-from torchrl.envs.utils import ExplorationType
-import datetime
+from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDictModule
+from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world,GaussianActor
+from einops.layers.torch import Rearrange
+from torchrl.modules import ProbabilisticActor
+from torchrl.envs.transforms import CatTensors
+from torchrl.modules.distributions import TanhNormal
+from copy import deepcopy
+class ActorNetwork(nn.Module):
+    def __init__(self, obs_dim, action_dim, device):
+        super().__init__()
+        # lidar特征提取
 
-os.environ["http_proxy"] = "http://127.0.0.1:7890"
-os.environ["https_proxy"] = "http://127.0.0.1:7890"
-
-FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "../cfg")
-
-# def knowledge_distillation_loss(student_output, teacher_output, temperature=3.0, alpha=0.7):
-#     """
-#     NavRL知识蒸馏损失计算，适配连续动作空间
-#     Args:
-#         student_output: tuple (actions, mu, log_std) from student actor
-#         teacher_output: tuple (actions, mu, log_std) from teacher actor  
-#         temperature: 蒸馏温度，控制分布软化程度
-#         alpha: 蒸馏损失权重
-#     """
-#     if isinstance(student_output, tuple) and isinstance(teacher_output, tuple):
-#         # SAC actor返回tuple: (action, mu, log_std)
-#         student_action, student_mu, student_log_std = student_output
-#         teacher_action, teacher_mu, teacher_log_std = teacher_output
-        
-#         # 对连续动作使用MSE损失
-#         action_loss = F.mse_loss(student_action, teacher_action.detach())
-#         mu_loss = F.mse_loss(student_mu, teacher_mu.detach()) 
-#         std_loss = F.mse_loss(student_log_std, teacher_log_std.detach())
-        
-#         distillation_loss = alpha * (action_loss + 0.5 * (mu_loss + std_loss))
-#     else:
-#         # fallback for tensor inputs
-#         distillation_loss = alpha * F.mse_loss(student_output, teacher_output.detach())
-    
-#     return distillation_loss
-def knowledge_distillation_loss(student_actions, teacher_actions, temperature=3.0, alpha=0.7):
-    """
-    NavRL知识蒸馏损失计算，适配连续动作空间和TensorDict结构
-    对三个维度(vx, vy, vz)分别计算损失以便于监控
-    Args:
-        student_actions: Tensor [batch_size, 3] from student policy normalized actions
-        teacher_actions: Tensor [batch_size, 3] from teacher policy normalized actions
-        temperature: 蒸馏温度，控制分布软化程度
-        alpha: 蒸馏损失权重
-    Returns:
-        total_loss: 总的蒸馏损失
-        loss_dict: 包含各维度损失的字典，用于wandb记录
-    """
-    # NavRL uses normalized actions in [-1, 1] range before world coordinate transform
-    # Actions represent [vx, vy, vz] in goal-aligned frame via utils.vec_to_world
-    
-    # 分别计算三个维度的MSE损失
-    loss_vx = F.mse_loss(student_actions[:, 0], teacher_actions[:, 0].detach())
-    loss_vy = F.mse_loss(student_actions[:, 1], teacher_actions[:, 1].detach())
-    loss_vz = F.mse_loss(student_actions[:, 2], teacher_actions[:, 2].detach())
-    
-    # 总损失（加权平均）
-    total_loss = alpha * (loss_vx + loss_vy + loss_vz) / 3.0
-    
-    # 返回详细的损失字典供wandb记录
-    loss_dict = {
-        "kd_loss_vx": loss_vx.item(),
-        "kd_loss_vy": loss_vy.item(),
-        "kd_loss_vz": loss_vz.item(),
-        "kd_loss_total": total_loss.item(),
-        # 记录各维度的相对重要性
-        "kd_loss_vx_ratio": (loss_vx / (loss_vx + loss_vy + loss_vz + 1e-8)).item(),
-        "kd_loss_vy_ratio": (loss_vy / (loss_vx + loss_vy + loss_vz + 1e-8)).item(),
-        "kd_loss_vz_ratio": (loss_vz / (loss_vx + loss_vy + loss_vz + 1e-8)).item(),
-    }
-    
-    return total_loss, loss_dict
-@hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
-def main(cfg):
-    # Simulation App
-    sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
-
-    # Wandb initialization
-    wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    if (cfg.wandb.run_id is None):
-        run = wandb.init(
-            project=cfg.wandb.project,
-            name=f"KD_{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            config=wandb_config,
-            mode=cfg.wandb.mode,
-            id=wandb.util.generate_id(),
+        feature_extractor_network = nn.Sequential(
+            nn.Conv2d(in_channels=1,out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
+            nn.Conv2d(in_channels=4,out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
+            nn.Conv2d(in_channels=16,out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+            Rearrange("n c w h -> n (c w h)"),
+            nn.Linear(in_features=288,out_features=128), nn.LayerNorm(128),
         )
-    else:
-        run = wandb.init(
-            project=cfg.wandb.project,
-            name=f"KD_{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            config=wandb_config,
-            mode=cfg.wandb.mode,
-            id=cfg.wandb.run_id,
-            resume="must"
+        # 动态障碍特征提取
+        dynamic_obstacle_network = nn.Sequential(
+            Rearrange("n c w h -> n (c w h)"),
+            nn.Linear(50, 128),
+            nn.LeakyReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(),
+            nn.LayerNorm(64),
         )
+        # 总特征拼接+MLP
+        self.feature_extractor = TensorDictSequential(
+            TensorDictModule(feature_extractor_network, [("observation", "lidar")], ["_cnn_feature"]),
+            TensorDictModule(dynamic_obstacle_network, [("observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
+            CatTensors(["_cnn_feature", ("observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
+            # TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+            TensorDictModule(nn.LayerNorm(200), ["_feature"], ["_feature"]),
+        ).to(device)
+        # 
+        self.actor = ProbabilisticActor(
+            TensorDictSequential(
+                TensorDictModule(nn.Sequential(
+                    nn.Linear(200, 256),
+                    nn.LeakyReLU(),
+                    nn.LayerNorm(256),
+                    nn.Linear(256, 256),
+                    nn.LeakyReLU(),
+                    nn.LayerNorm(256),
+                ), in_keys=["_feature"], out_keys=["_feature_"]),
+                TensorDictModule(GaussianActor(action_dim), in_keys=["_feature_"], out_keys=["loc", "scale"])
+            ),
+            in_keys=["loc", "scale"],
+            out_keys=["action_normalized"], 
+            distribution_class=TanhNormal,
+            return_log_prob=True
+        ).to(device)
 
-    # Environment setup
-    from env import NavigationEnv
-    env = NavigationEnv(cfg)
-    
-    transforms = []
-    controller = LeePositionController(9.81, env.drone.params).to(cfg.device)
-    vel_transform = VelController(controller, yaw_control=False)
-    transforms.append(vel_transform)
-    transformed_env = TransformedEnv(env, Compose(*transforms)).train()
-    transformed_env.set_seed(cfg.seed)
+    def forward(self, state):
+        tensordict = TensorDict({"observation": state}, batch_size=state.shape[0])
+        tensordict = self.feature_extractor(tensordict)
+        tensordict = self.actor(tensordict)
+        return tensordict["action_normalized"], tensordict["loc"],tensordict["scale"]
 
-    # Initialize teacher and student policies
-    policy_t = SAC(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
-    policy_s = NavRLModel(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
-    
-    # Load pretrained models
-    policy_t.load_state_dict(torch.load("/home/u20/NavRL/isaac-training/training/scripts/checkpoint/CSAC_0_2100.pt"))
-    # Set training modes properly - avoid calling .eval() on SAC due to method name conflict
-    # Teacher should not be updated, so set requires_grad=False for all parameters
-    for param in policy_t.parameters():
-        param.requires_grad = False
-    policy_t.training = False  # Set training flag directly instead of calling .eval()
+class CriticNetwork(nn.Module):
+    def __init__(self,obs_dim ,action_dim, device):
+        super().__init__()
+        # lidar特征提取
 
-    # policy_s.load_state_dict(torch.load("/home/u20/NavRL/isaac-training/training/scripts/checkpoint/student_checkpoint_50000.pt"))
-    # Student remains in training mode
-    policy_s.training = True
-    for param in policy_s.parameters():
-        param.requires_grad = True
-
-    # Replay buffer for storing teacher-generated data
-    replay_buffer = TensorDictReplayBuffer(
-        storage=LazyTensorStorage(
-            max_size=cfg.algo.buffer_size,  # 减少buffer大小节省显存
-            # device="cpu"  # 将buffer存储在CPU上
-        ),
-        batch_size=cfg.algo.batch_size,  # 减少batch size
-    )
-
-    # Episode Stats Collector
-    episode_stats_keys = [
-        k for k in transformed_env.observation_spec.keys(True, True) 
-        if isinstance(k, tuple) and k[0]=="stats"
-    ]
-    episode_stats = EpisodeStats(episode_stats_keys)
-
-    # Data collector using teacher policy for sampling
-    collector = SyncDataCollector(
-        transformed_env,
-        policy=policy_t,  # Use teacher policy for data collection
-        frames_per_batch=cfg.env.num_envs * cfg.training_frame_num, 
-        total_frames=cfg.max_frame_num,
-        device=cfg.device,
-        return_same_td=True,
-        exploration_type=ExplorationType.MEAN,  # Use teacher's mean action
-    )
-
-    # Knowledge distillation parameters
-    kd_temperature = cfg.get('kd_temperature', 3.0)
-    kd_alpha = cfg.get('kd_alpha', 0.7)
-    update_counter = 0
-    warmup_steps = cfg.algo.warmup_steps
-    
-    # 增加训练频次参数 - 提高样本利用效率
-    training_epoch_num = cfg.get('training_epoch_num', 3)  # 减少到2次，避免显存溢出
-    print(f"[NavRL KD]: training_epoch_num: {training_epoch_num}")
-    print(f"[NavRL KD]: Reduced for memory efficiency with 224x224 inputs")
-
-    # # 显存优化设置
-    # torch.backends.cudnn.benchmark = False  # 减少显存使用
-    # torch.cuda.empty_cache()  # 清理显存缓存
-
-
-
-    try:
-        for i, data in enumerate(collector):
-            # Store teacher-generated data
-            data = data.reshape(-1).cpu()
-            replay_buffer.extend(data)
-            
-            info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
-            
-            if len(replay_buffer) >= warmup_steps:
-                # 对每批数据进行多次训练更新 - 显存优化版本
-                batch_losses = []
-                batch_lr_values = []
-                
-                for update_idx in range(training_epoch_num):
-                    # 显存管理 - 每次更新前清理
-                    # torch.cuda.empty_cache()
-                    
-                    # Sample batch from teacher experience buffer
-                    batch = replay_buffer.sample().to(cfg.device)
-                    
-                    obs = batch[("agents", "observation")]
-                    
-                    # Teacher inference with frozen parameters (no gradients)
-                    with torch.no_grad():
-                        # 使用更简洁的teacher调用，避免额外TensorDict创建
-                        teacher_output = policy_t(batch)
-                        teacher_actions = teacher_output[("agents", "action_normalized")]
-                        
-                        # 立即释放teacher相关tensor
-                        del teacher_output
-                    
-                    # Student forward pass - 内存优化
-                    with torch.cuda.amp.autocast(enabled=True):  # 使用混合精度
-                        # 直接使用batch而不是重新创建TensorDict
-                        student_latent = policy_s.shared_features(
-                            obs["camera"],
-                            obs["dynamic_obstacle"], 
-                            obs["state"]
-                        )
-                        
-                        # 创建临时tensordict for actor
-                        temp_td = batch.clone()
-                        temp_td.set("_latent", student_latent)
-                        
-                        # Get student actions
-                        policy_s.actor_head(temp_td)
-                        student_actions = temp_td[("agents", "action_normalized")]
-                        
-                        # Knowledge distillation loss with dimension-wise tracking
-                        kd_loss, kd_loss_dict = knowledge_distillation_loss(
-                            student_actions, teacher_actions, 
-                            temperature=kd_temperature, alpha=kd_alpha
-                        )
-                    
-                    # 清理中间变量
-                    # del student_latent, temp_td
-                    
-                    # Student parameter update - 混合精度优化
-                    policy_s.optimizer.zero_grad()
-                    
-                    if hasattr(policy_s, 'scaler') and policy_s.scaler:
-                        policy_s.scaler.scale(kd_loss).backward()
-                        policy_s.scaler.unscale_(policy_s.optimizer)
-                        torch.nn.utils.clip_grad_norm_(policy_s.parameters(), max_norm=1.0)
-                        policy_s.scaler.step(policy_s.optimizer)
-                        policy_s.scaler.update()
-                    else:
-                        kd_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(policy_s.parameters(), max_norm=1.0)
-                        policy_s.optimizer.step()
-                    
-                    # 收集统计信息（包含维度级损失）
-                    batch_losses.append(kd_loss.item())
-                    batch_lr_values.append(policy_s.optimizer.param_groups[0]['lr'])
-                    
-                    # 累积维度级损失用于平均
-                    if update_idx == 0:
-                        batch_kd_losses = {k: [v] for k, v in kd_loss_dict.items()}
-                    else:
-                        for k, v in kd_loss_dict.items():
-                            batch_kd_losses[k].append(v)
-                    
-                    update_counter += 1
-                    
-                    # # 立即清理本次更新的tensor
-                    # del batch, obs, student_actions, teacher_actions, kd_loss
-                    # torch.cuda.empty_cache()
-                
-                # 计算平均损失和训练统计
-                if batch_losses:  # 确保有有效的损失记录
-                    avg_kd_loss = sum(batch_losses) / len(batch_losses)
-                    avg_lr = sum(batch_lr_values) / len(batch_lr_values)
-                    
-                    # 计算维度级损失的平均值
-                    avg_kd_losses = {
-                        f"train/{k}": sum(v) / len(v) 
-                        for k, v in batch_kd_losses.items()
-                    }
-                    
-                    # Log training statistics with memory usage and dimension-wise losses
-                    train_stats = {
-                        "train/kd_loss": avg_kd_loss,
-                        "train/kd_loss_std": torch.std(torch.tensor(batch_losses)).item() if len(batch_losses) > 1 else 0.0,
-                        "train/update_counter": update_counter,
-                        "train/updates_this_step": len(batch_losses),
-                        "train/student_lr": avg_lr,
-                        "train/gpu_memory_allocated": torch.cuda.memory_allocated(cfg.device) / 1e9,  # GB
-                        "train/gpu_memory_reserved": torch.cuda.memory_reserved(cfg.device) / 1e9,   # GB
-                    }
-                    # 添加维度级损失到统计中
-                    train_stats.update(avg_kd_losses)
-                    info.update(train_stats)
-                    
-                    # 清理batch statistics
-                    # del batch_losses, batch_lr_values
-                
-            else:
-                # Buffer warmup phase
-                info.update({
-                    "train/status": "buffer_warmup",
-                    "train/warmup_progress": len(replay_buffer) / warmup_steps
-                })
-            
-            # Episode statistics
-            episode_stats.add(data)
-            if len(episode_stats) >= transformed_env.num_envs:
-                stats = {
-                    "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
-                    for k, v in episode_stats.pop().items(True, True)
-                }
-                info.update(stats)
-
-            # Evaluation using student policy
-            if i % cfg.eval_interval == 0 and i > 0:
-                torch.cuda.empty_cache()
-                print(f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Evaluating student policy at step: {i}")
-                # env.enable_render(True)
-                env.eval()
-                
-                # Evaluate student policy
-                eval_info_student = evaluate(
-                    env=transformed_env, 
-                    policy=policy_s,
-                    seed=cfg.seed, 
-                    cfg=cfg,
-                    exploration_type=ExplorationType.MEAN
-                )
-                
-                # # Optionally compare with teacher performance
-                # eval_info_teacher = evaluate(
-                #     env=transformed_env, 
-                #     policy=policy_t,
-                #     seed=cfg.seed, 
-                #     cfg=cfg,
-                #     exploration_type=ExplorationType.MEAN
-                # )
-                
-                # env.enable_render(not cfg.headless)
-                env.train()
-                env.reset()
-                
-                # Add prefixes to distinguish student vs teacher metrics
-                eval_info = {}
-                for k, v in eval_info_student.items():
-                    eval_info[f"student_{k}"] = v
-                # for k, v in eval_info_teacher.items():
-                #     eval_info[f"teacher_{k}"] = v
-                    
-                info.update(eval_info)
-                print(f"Student performance vs Teacher comparison logged")
-
-            # Log to wandb
-            run.log(info)
-            
-            # 定期显存清理
-            if i % 10 == 0:
-                torch.cuda.empty_cache()
-            
-            if i % 50 == 0:
-                print(f"\n[Step {i}] Knowledge Distillation Training Summary:")
-                for k, v in info.items():
-                    if isinstance(v, (float, int)) and 'train/' in k:
-                        if 'gpu_memory' in k:
-                            print(f"  {k:<30}: {v:.2f} GB")
-                        else:
-                            print(f"  {k:<30}: {v:.4f}")
-                print(f"  Buffer Size: {len(replay_buffer):,}")
-                print(f"  Total Updates: {update_counter:,}")
-                if 'train/updates_this_step' in info:
-                    print(f"  Updates/Step: {info['train/updates_this_step']}")
-                print("-" * 60)
-
-            # Save student model
-            if i % cfg.save_interval == 0:
-                ckpt_path = os.path.join(run.dir, f"student_checkpoint_{i}.pt")
-                torch.save(policy_s.state_dict(), ckpt_path)
-                print(f"[NavRL]: Student model saved at step: {i}")
-
-        # Final save
-        ckpt_path = os.path.join(run.dir, "student_checkpoint_final.pt")
-        torch.save(policy_s.state_dict(), ckpt_path)
-        wandb.finish()
-        sim_app.close()
+        feature_extractor_network = nn.Sequential(
+            nn.Conv2d(in_channels=1,out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
+            nn.Conv2d(in_channels=4,out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
+            nn.Conv2d(in_channels=16,out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+            Rearrange("n c w h -> n (c w h)"),
+            nn.Linear(288,128), nn.LayerNorm(128),
+        )
+        # 动态障碍特征提取
+        dynamic_obstacle_network = nn.Sequential(
+            Rearrange("n c w h -> n (c w h)"),
+            nn.Linear(50, 128),
+            nn.LeakyReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(),
+            nn.LayerNorm(64),
+        )
+        # 总特征拼接+MLP
+        self.feature_extractor = TensorDictSequential(
+            TensorDictModule(feature_extractor_network, [("observation", "lidar")], ["_cnn_feature"]),
+            TensorDictModule(dynamic_obstacle_network, [("observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
+            CatTensors(["_cnn_feature", ("observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
+            # TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+            TensorDictModule(nn.LayerNorm(200), ["_feature"], ["_feature"]),
+        ).to(device)
         
-    except KeyboardInterrupt:
-        print("\n[NavRL]: KeyboardInterrupt received. Saving student model...")
-        ckpt_path = os.path.join(run.dir, f"student_checkpoint_interrupt.pt")
-        torch.save(policy_s.state_dict(), ckpt_path)
-        run.log({"interrupted_at_step": i})
-        run.finish()
-        sim_app.close()
-        exit(0)
+        # Q网络
+        self.qvalue = TensorDictSequential(
+            CatTensors(["_feature", "action_normalized"], "_feature_action", del_keys=False),
+            TensorDictModule(
+                nn.Sequential(
+                    nn.Linear(200 + action_dim, 256),
+                    nn.LeakyReLU(),
+                    nn.LayerNorm(256),
+                    nn.Linear(256, 256),
+                    nn.LeakyReLU(),
+                    nn.LayerNorm(256),
+                    nn.Linear(256, 1),
+                ),
+                in_keys=["_feature_action"],       # <- 这里要读取拼接后的键
+                out_keys=["state_action_value"],   # <- 直接输出最终值到 state_action_value
+            ),
+        ).to(device)
+    def forward(self, s,a):
+        tensordict = TensorDict({"observation": s, "action_normalized": a.squeeze(1)}, batch_size=s.shape[0])
+        tensordict = self.feature_extractor(tensordict)
+        q = self.qvalue(tensordict)["state_action_value"]
+        return q
+    
 
-if __name__ == "__main__":
-    main()
+
+
+class SAC(TensorDictModuleBase):
+    def __init__(self, cfg, observation_spec, action_spec, device,cost_lim=6e-3):
+        super().__init__()
+        # Initialize the SAC agent with configuration, observation and action specs, and device
+        self.cfg = cfg
+        self.obs_dim = observation_spec
+        self.act_dim = action_spec
+        self.q = cfg.entropic_index
+        self.device = device
+                # 兼容 action_spec 为整数或有 shape 的 Spec，提取 action_dim
+        if hasattr(self.act_dim, "shape"):
+            # action_spec.shape 可能是 tuple，例如 (action_dim,) 或 (n_agents, action_dim)
+            shape = tuple(self.act_dim.shape)
+            # 取最后一维作为 action_dim（如果是复合维度，请按需修改）
+            self.act_dim = int(shape[-1]) if len(shape) > 0 else int(shape[0])
+        else:
+            self.act_dim = int(self.act_dim)
+        # Initialize networks
+        self.actor = ActorNetwork(self.obs_dim, self.act_dim, device).to(self.device)
+        self.critic1 = CriticNetwork(self.obs_dim, self.act_dim, device).to(self.device)
+        self.critic2 = CriticNetwork(self.obs_dim, self.act_dim, device).to(self.device)
+        self.critic1_cost1 = CriticNetwork(self.obs_dim, self.act_dim, device).to(self.device)
+        self.critic2_cost2 = CriticNetwork(self.obs_dim, self.act_dim, device).to(self.device)
+        self.critic1_target = deepcopy(self.critic1)
+        self.critic2_target = deepcopy(self.critic2)
+        self.critic1_cost_target = deepcopy(self.critic1_cost1)
+        self.critic2_cost_target = deepcopy(self.critic2_cost2)
+        #Initialize Temperature parameter
+        # self.log_alpha = nn.Parameter(torch.log(torch.tensor(5, device=device)))
+        self.log_alpha = nn.Parameter(torch.log(torch.tensor(1, device=device)))
+        # self.log_lam = nn.Parameter(torch.log(torch.tensor(100, device=device)))
+        self.log_lam = nn.Parameter(torch.log(torch.tensor(0.1, device=device)))
+        self.alpha = self.log_alpha.exp().detach()
+        self.lam = self.log_lam.exp().detach()
+        # self.lam = nn.Parameter(torch.tensor(0.0, device=device))
+        self.target_entropy = -float(self.act_dim)
+        self.cost_lim = 6e-3
+
+        #Initialize Parameters
+        self.gamma = getattr(cfg, 'gamma', 0.99)
+        self.action_limit = getattr(cfg.actor, 'action_limit', 2.0)
+        
+        # Improved optimizers with different learning rates
+        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
+        self.critic1_optim = torch.optim.Adam(self.critic1.parameters(), lr=cfg.critic.learning_rate)
+        self.critic2_optim = torch.optim.Adam(self.critic2.parameters(), lr=cfg.critic.learning_rate)
+        self.critic1_cost_optim = torch.optim.Adam(self.critic1_cost1.parameters(), lr=cfg.critic_cost.learning_rate)
+        self.critic2_cost_optim = torch.optim.Adam(self.critic2_cost2.parameters(), lr=cfg.critic_cost.learning_rate)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=cfg.alpha_learning_rate)
+        self.lambda_optim = torch.optim.Adam([self.log_lam], lr=cfg.lambda_learning_rate)
+
+
+        def init_(module):
+            from torch.nn.parameter import UninitializedParameter
+            # 只初始化最后一层 Linear 或 Conv2d 的 bias
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                w = getattr(module, "weight", None)
+                b = getattr(module, "bias", None)
+                if w is None or isinstance(w, UninitializedParameter):
+                    return
+                nn.init.orthogonal_(module.weight, 0.01)
+                # 检查是否为最后一层
+                if hasattr(module, 'out_features') and module.out_features == 1:
+                    if b is not None and not isinstance(b, UninitializedParameter):
+                        nn.init.constant_(module.bias, 0.0)
+        self.actor.apply(init_)
+        self.critic1.apply(init_)
+        self.critic2.apply(init_)
+        self.critic1_cost1.apply(init_)
+        self.critic2_cost2.apply(init_)
+        self.critic1_target.apply(init_)
+        self.critic2_target.apply(init_)
+
+        
+    def tsallis_entropy_log_q(self, x, q):
+        safe_x = torch.max(x, torch.Tensor([1e-6]).to(self.device))
+
+        if q == 1:
+            log_q_x = torch.log(safe_x)
+        else:
+            log_q_x = (safe_x.pow(q-1)-1)/(q-1)
+        return log_q_x.sum(dim=-1)
+    
+    def get_action(self, state, deterministic=True):
+        if deterministic:
+            with torch.no_grad():
+                action, mu, log_std = self.actor(state)
+            return action
+        else:
+            _ , mu, log_std = self.actor(state)
+            std = log_std.exp().clamp(min=1e-6)
+            normal = torch.distributions.Normal(mu, std)
+            x_t = normal.rsample()
+            actions = torch.tanh(x_t)
+
+            # Calculate log probabilities with correction for tanh
+            log_probs = normal.log_prob(x_t) - torch.log(1 - actions.pow(2) + 1e-6)
+            log_probs = log_probs.sum(-1)
+
+            return actions,log_probs
+    def __call__(self,td):
+        td = td.to(self.device)
+        action_n, mu, log_std= self.actor(td["agents","observation"])
+        actions_world = self.actions_to_world(action_n, td).squeeze(-1)
+        td["agents","action"] = actions_world
+        td["agents","action_normalized"] = action_n
+        return td
+    def train(self,replay_buffer, batch_size, tau=0.005,cost_lim=6e-3):
+        """SAC training step with improved stability"""
+        train_tds = []
+        self.cost_lim = cost_lim
+        # Sample batch
+        for _ in range(self.cfg.num_minibatches):
+            batch = replay_buffer.sample(batch_size).to(self.device)
+            states = batch['agents','observation'].squeeze(-1).to(self.device)
+            actions = batch['agents','action_normalized'].to(self.device)  # Normalize actions
+            rewards = batch['next', 'agents','reward'].squeeze(1).to(self.device)
+            costs = batch['next', 'agents','cost'].squeeze(1).to(self.device)
+            next_states = batch['next', 'agents','observation'].squeeze(-1).to(self.device)
+            # dones = (
+            #     batch['next', 'terminated'].squeeze(-1).to(torch.bool)
+            #     | batch['next', 'truncated'].squeeze(-1).to(torch.bool)
+            # ).float().to(self.device)
+            dones = batch['next', 'terminated'].squeeze(-1).to(torch.bool).float().to(self.device)
+            # ============ Update Critics ============
+            with torch.no_grad():
+                # Sample next actions using current policy
+                next_actions,next_log_probs = self.get_action(next_states,deterministic=False)
+
+                # Target Q values
+                next_q1 = self.critic1_target(next_states, next_actions).squeeze(-1)
+                next_q2 = self.critic2_target(next_states, next_actions).squeeze(-1)
+                next_q = torch.min(next_q1, next_q2)
+                # Compute target with entropy regularization
+                target_q = rewards + self.gamma * (1 - dones) * (next_q - self.alpha * next_log_probs)
+
+                # Target costs
+                next_cost1 = self.critic1_cost_target(next_states, next_actions).squeeze(-1)   
+                next_cost2 = self.critic2_cost_target(next_states, next_actions).squeeze(-1)
+                # next_cost = torch.mean(next_cost1, next_cost2)
+                next_cost = (next_cost1 + next_cost2) / 2
+                # next_cost = next_cost1
+                target_costs = costs + self.gamma * (1 - dones) * next_cost
+                target_costs = torch.clamp(target_costs, min=0.0)  
+            # Current Q values
+            q1 = self.critic1(states, actions).squeeze(-1)
+            q2 = self.critic2(states, actions).squeeze(-1)
+            q1_cost = self.critic1_cost1(states, actions).squeeze(-1)
+            q2_cost = self.critic2_cost2(states, actions).squeeze(-1)
+            
+            # Critic losses
+            critic1_loss = F.mse_loss(q1, target_q)
+            critic2_loss = F.mse_loss(q2, target_q)
+            #Critic cost losses
+            critic1_cost_loss = F.mse_loss(q1_cost, target_costs)
+            critic2_cost_loss = F.mse_loss(q2_cost, target_costs)
+
+            # Update critics
+            self.critic1_optim.zero_grad()
+            critic1_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 1.0)  # Gradient clipping
+            self.critic1_optim.step()
+            
+            self.critic2_optim.zero_grad()
+            critic2_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 1.0)  # Gradient clipping
+            self.critic2_optim.step()
+            
+            self.critic1_cost_optim.zero_grad()
+            critic1_cost_loss.backward()
+            self.critic1_cost_optim.step()
+            self.critic2_cost_optim.zero_grad() 
+            critic2_cost_loss.backward()
+            self.critic2_cost_optim.step()
+            
+            # ============ Update Actor ============
+            # Resample actions for actor update
+            actions_new, log_probs = self.get_action(states,deterministic=False)
+
+            
+            # Q values for new actions
+            q1_new = self.critic1(states, actions_new).squeeze(-1)
+            q2_new = self.critic2(states, actions_new).squeeze(-1)
+            q_min = torch.min(q1_new, q2_new)
+            
+            q1_cost_new = self.critic1_cost1(states, actions_new).squeeze(-1)
+            q2_cost_new = self.critic2_cost2(states, actions_new).squeeze(-1)
+            # q_cost_max = q1_cost_new
+            q_cost_max = (q1_cost_new + q2_cost_new) / 2
+
+            # Actor loss
+            actor_loss = (self.alpha * log_probs - q_min + self.lam * q_cost_max).mean()
+
+            # Update actor
+            self.actor_optim.zero_grad()
+            actor_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # Gradient clipping
+            self.actor_optim.step()
+            
+            # ============ Update Temperature ============
+
+            alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+        
+            violation = q_cost_max - self.cost_lim
+            lambda_loss = -(self.log_lam * violation.detach()).mean()
+
+            # Update temperature
+            self.alpha_optim.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optim.step()
+            self.alpha = self.log_alpha.exp()
+            
+            self.lambda_optim.zero_grad()
+            lambda_loss.backward()
+            self.lambda_optim.step()
+            self.lam = self.log_lam.exp()
+            # self.lam.data.clamp_(min=0.0)
+
+            # ============ Soft Update Target Networks ============
+            self._soft_update(self.critic1_target, self.critic1, tau)
+            self._soft_update(self.critic2_target, self.critic2, tau)
+            self._soft_update(self.critic1_cost_target, self.critic1_cost1, tau)
+            self._soft_update(self.critic2_cost_target, self.critic2_cost2, tau)
+
+            train_td =  TensorDict({
+                "actor_loss": actor_loss.item(),
+                "q1_loss": critic1_loss.item(),
+                "q2_loss": critic2_loss.item(),
+                "alpha_loss": alpha_loss.item(),
+                "alpha": self.alpha.item(),
+                "lambda_loss": lambda_loss.item(),
+                "lambda" : self.lam.item(),
+                "actor_lp": log_probs.mean(),
+                "q_min": q_min.mean(),
+                "q1_new": q1_new.mean(),
+                "q_cost": q_cost_max.mean(),
+                "cost_loss": critic1_cost_loss.item(),
+                "cost_lim": self.cost_lim,
+                # "td_error": (q1_new - target_q).mean(),
+                # "td_error_target": (q1 - target_q).mean(),
+            }, [])
+            train_tds.append(train_td)
+        loss_infos = torch.stack(train_tds).to_tensordict()
+        loss_infos = loss_infos.apply(torch.mean, batch_size=[])
+        return {k: v.mean().item() for k, v in loss_infos.items()}
+    def actions_to_world(self, actions, tensordict):
+        """将动作从局部坐标系转换到世界坐标系"""
+        actions = actions * self.cfg.actor.action_limit
+        actions_world = vec_to_world(actions,tensordict["agents", "observation", "direction"])
+        return actions_world
+    def _soft_update(self, target, source, tau):
+        for target_param, source_param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)

@@ -2,7 +2,7 @@
 Author: zdytim zdytim@foxmail.com
 Date: 2026-01-05 22:20:12
 LastEditors: zdytim zdytim@foxmail.com
-LastEditTime: 2026-01-07 00:16:15
+LastEditTime: 2026-01-14 01:37:54
 FilePath: /NavRL/isaac-training/training/scripts/models/navrl_model.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -94,14 +94,14 @@ class SharedFeatureExtractor(nn.Module):
             latent: 融合特征 [Batch, 128]
         """
         # 1. 相机数据预处理
-        camera = torch.nan_to_num(camera, nan=10.0, posinf=10.0, neginf=0.0)
-        camera = camera.clamp(0.0, 10.0)
+        camera = torch.nan_to_num(camera, nan=5.0, posinf=5.0, neginf=0.0)
+        camera = camera.clamp(0.0, 5.0)
         
         assert camera.dim() == 4, f"Camera input should be 4D [B,C,H,W], got {camera.shape}"
         assert camera.shape[1] == 1, f"Camera input should be grayscale (1 channel), got {camera.shape[1]} channels"
         
         # 归一化处理
-        x = (camera / 10 if camera.max() > 1.1 else camera)
+        x = (camera / 5 if camera.max() > 1.1 else camera)
         
         # 2. ViT特征提取（冻结状态）
         # with torch.no_grad():
@@ -383,7 +383,7 @@ class NavRLModel(TensorDictModuleBase):
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         
         # 3. 混合精度训练
-        self.use_amp = getattr(self.cfg, 'use_amp', True)
+        self.use_amp = getattr(self.cfg, 'use_amp', False)
         self.scaler = GradScaler() if self.use_amp else None
         
         if self.use_amp:
@@ -398,7 +398,8 @@ class NavRLModel(TensorDictModuleBase):
         vit_params = feature_groups['vit_decoder']
         
         if vit_params:
-            decoder_lr = self.cfg.actor.learning_rate * 0.1  # 10倍降低
+            # decoder_lr = self.cfg.actor.learning_rate * 0.1  # 10倍降低
+            decoder_lr = self.cfg.actor.learning_rate  * 0.1
             param_groups.append({
                 'params': vit_params, 
                 'lr': decoder_lr,
@@ -463,7 +464,32 @@ class NavRLModel(TensorDictModuleBase):
             'device': str(self.device),
             'use_amp': self.use_amp
         }
-
+    
+    # def get_value(self,tensordict: TensorDict) :
+    #     """仅计算价值函数"""
+    #     latent = self.shared_features(
+    #         tensordict["agents", "observation", "camera"],
+    #         tensordict["agents", "observation", "dynamic_obstacle"],
+    #         tensordict["agents", "observation", "state"]
+    #     )
+    #     value = self.critic_head(latent)
+    #     return value
+    # def get_action(self, tensordict: TensorDict) :
+    #     """仅计算动作"""
+    #     latent = self.shared_features(
+    #         tensordict["agents", "observation", "camera"],
+    #         tensordict["agents", "observation", "dynamic_obstacle"],
+    #         tensordict["agents", "observation", "state"]
+    #     )
+    #     tensordict.set("_latent", latent)
+        
+    #     # 策略采样
+    #     self.actor_head(tensordict)
+        
+    #     # 坐标转换 (Local -> World)
+    #     actions = (2 * tensordict["agents", "action_normalized"] * self.cfg.actor.action_limit) - self.cfg.actor.action_limit
+    #     actions_world = vec_to_world(actions, tensordict["agents", "observation", "direction"])
+    #     return actions_world
 
 class ModelManager:
     """
@@ -668,67 +694,7 @@ class ModelManager:
         except Exception as e:
             print(f"❌ Failed to upload model to wandb: {e}")
     
-    def _create_model_card(self, filepath: str, model_info: Dict, step: int, 
-                          metadata: Optional[Dict] = None) -> str:
-        """创建模型卡片"""
-        # 创建临时模型卡片文件
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
-            f.write(f"""# NavRL Model Card - Step {step}
 
-## Model Overview
-- **Architecture**: PPO-ViT with Shared Feature Extractor  
-- **Training Step**: {step:,}
-- **File Size**: {os.path.getsize(filepath) / (1024**2):.2f} MB
-
-## Architecture Details
-- **Total Parameters**: {model_info['total_parameters']:,}
-- **Trainable Parameters**: {model_info['trainable_parameters']:,}  
-- **Frozen Parameters**: {model_info['frozen_parameters']:,}
-- **Action Dimension**: {model_info['action_dim']}
-- **Mixed Precision**: {'Enabled' if model_info['use_amp'] else 'Disabled'}
-
-## Component Breakdown
-- **ViT Decoder**: {model_info['vit_decoder_params']:,} parameters
-- **Other Modules**: {model_info['other_modules_params']:,} parameters
-
-## Training Configuration
-- **Device**: {model_info['device']}
-- **Optimizer**: Adam with grouped learning rates
-- **Loss Function**: PPO with value clipping
-
-""")
-
-            # 添加额外的元数据信息
-            if metadata:
-                f.write("## Training Metrics\n")
-                for key, value in metadata.items():
-                    if isinstance(value, (int, float)):
-                        f.write(f"- **{key.replace('_', ' ').title()}**: {value:.4f}\n")
-                    else:
-                        f.write(f"- **{key.replace('_', ' ').title()}**: {value}\n")
-                f.write("\n")
-            
-            f.write("""## Usage
-```python
-# 加载模型
-from models import load_pretrained_model
-model_manager = load_pretrained_model(checkpoint_path, cfg, obs_spec, act_spec, device)
-model = model_manager.get_model()
-
-# 推理
-output = model(input_tensordict)
-```
-
-## Model Components
-1. **SharedFeatureExtractor**: ViT-based visual feature extraction
-2. **Actor Head**: Policy network with Beta distribution
-3. **Critic Head**: Value function estimation
-4. **Optimization**: Grouped learning rates for ViT fine-tuning
-
-Generated by NavRL ModelManager
-""")
-            return f.name
-    
     def upload_model_to_registry(self, model_name: str, description: str = "",
                                 tags: Optional[List[str]] = None,
                                 step: int = 0) -> None:
