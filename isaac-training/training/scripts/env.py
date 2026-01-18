@@ -11,7 +11,8 @@ from omni_drones.robots.drone import MultirotorBase
 from omni.isaac.orbit.assets import AssetBaseCfg
 from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis, quaternion_to_euler
-from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
+from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns,RayCasterCamera
+from omni.isaac.orbit.sensors.ray_caster.ray_caster_camera_cfg import RayCasterCameraCfg
 from utils import vec_to_new_frame, vec_to_world, construct_input
 import omni.isaac.core.utils.prims as prim_utils
 from pxr import Sdf, Gf
@@ -19,6 +20,7 @@ import omni.isaac.orbit.sim as sim_utils
 import omni.isaac.orbit.utils.math as math_utils
 from omni_drones.sensors.camera import Camera, PinholeCameraCfg
 import dataclasses
+from omni.isaac.orbit.sensors.ray_caster.patterns import PinholeCameraPatternCfg
 from omni.isaac.orbit.assets import RigidObject, RigidObjectCfg
 import time
 import cv2
@@ -47,38 +49,39 @@ class NavigationEnv(IsaacEnv):
         super().__init__(cfg, cfg.headless)
         
         # Drone Initialization
-        camera_cfg = PinholeCameraCfg(
-            resolution=(224, 224),
-            usd_params=PinholeCameraCfg.UsdCameraCfg(
-                horizontal_aperture=36.0,      # mm
-                # vertical_aperture=36.0,        # mm
-                focal_length=18.9,             # 取平均约为20mm
-                clipping_range=(0.05, 5.0),    # 可视距离范围，按需求设置
-            ),           
-            sensor_tick=1,
-            data_types=["distance_to_camera"],
-            # 添加性能优化配置
-            # colorize_semantic_segmentation=False,  # 禁用语义分割着色
-            # semantic_filter_predicate="",  # 空过滤器
-        )
-        self.camera_sensor = Camera(camera_cfg)
-        self.camera_sensor1 = Camera(camera_cfg)    
-
+        # camera_cfg = PinholeCameraCfg(
+        #     resolution=(224, 224),
+        #     usd_params=PinholeCameraCfg.UsdCameraCfg(
+        #         horizontal_aperture=36.0,      # mm
+        #         # vertical_aperture=36.0,        # mm
+        #         focal_length=18.9,             # 取平均约为20mm
+        #         clipping_range=(0.05, 5.0),    # 可视距离范围，按需求设置
+        #     ),           
+        #     sensor_tick=1,
+        #     data_types=["distance_to_camera"],
+        #     # 添加性能优化配置
+        #     # colorize_semantic_segmentation=False,  # 禁用语义分割着色
+        #     # semantic_filter_predicate="",  # 空过滤器
+        # )
+        # self.camera_sensor = Camera(camera_cfg)
+        # self.camera_sensor1 = Camera(camera_cfg)    
+        # self.camera_sensor.import_usd("/home/zdytim/zdytim/RD_CSAC_RL/isaac-training/third_party/OmniDrones/omni_drones/sensors/saved_stage.usd", root_path="/World", as_reference=True)
+        # self.camera_sensor1.import_usd("/home/zdytim/zdytim/RD_CSAC_RL/isaac-training/third_party/OmniDrones/omni_drones/sensors/saved_stage.usd", root_path="/World", as_reference=True)
         # camera for visualization
-        self.camera_sensor.initialize("/World/envs/env_.*/Camera0")  # 更新路径
-        self.camera_sensor1.initialize("/World/envs/env_.*/Hummingbird_0/base_link/Camera1")  # 更新路径
-        if cfg.headless == False:
-            # 使用距离场可视化
-            vis_camera_cfg = camera_cfg
-            self.camera_vis = Camera(vis_camera_cfg)
-            self.camera_vis.initialize("/World/envs/env_.*/Hummingbird_0/base_link/Camera")
-            # 记录可视化相机是否需要更新
-            self.has_vis_camera = True
-        else:
-            self.has_vis_camera = False
+        # self.camera_sensor.initialize("/World/envs/env_.*/Camera0")  # 更新路径
+        # self.camera_sensor1.initialize("/World/envs/env_.*/Hummingbird_0/base_link/Camera1")  # 更新路径
+        # if cfg.headless == False:
+        #     # 使用距离场可视化
+        #     vis_camera_cfg = camera_cfg
+        #     self.camera_vis = Camera(vis_camera_cfg)
+        #     self.camera_vis.initialize("/World/envs/env_.*/Hummingbird_0/base_link/Camera")
+        #     # 记录可视化相机是否需要更新
+        #     self.has_vis_camera = True
+        # else:
+        #     self.has_vis_camera = False
         self.drone.initialize()
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
-        self.camera_images = None  #  先初始化为 None
+        # self.camera_images = None  #  先初始化为 None
         # LiDAR Intialization
         ray_caster_cfg = RayCasterCfg(
             prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
@@ -97,6 +100,34 @@ class NavigationEnv(IsaacEnv):
         self.lidar._initialize_impl()
         self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams) 
         
+        lidar2_hbeams = 224
+        lidar2_vbeams = 224
+        lidar2_hfov = 87.2  # 总水平视场角度
+        lidar2_vfov = 87.2  # 总垂直视场角度
+
+        lidar2_cfg = RayCasterCameraCfg(
+            prim_path="/World/envs/env_.*/Hummingbird_0/base_link/lidar2",
+            offset=RayCasterCameraCfg.OffsetCfg(
+                pos=(0.0, 0.0, 0.0),
+                rot=(0.0, 0.0, 1.0, 0.0)，
+                # rot=(0.7071, 0.0, 0.7071, 0.0),
+                # rot=(0.5, 0.5, -0.5, -0.5),  # 绕y轴-90度，正对无人机x+方向
+                convention="ros"
+            ),
+            attach_yaw_only=True,
+            pattern_cfg=PinholeCameraPatternCfg(
+                focal_length=24.0,
+                horizontal_aperture=36.0,
+                height=224,
+                width=224,
+            ),
+            mesh_prim_paths=["/World/ground"],
+            data_types=["distance_to_image_plane"],
+            debug_vis=True,
+        )
+        self.lidar2 = RayCasterCamera(lidar2_cfg)
+        self.lidar2._initialize_impl()
+        self.lidar2_resolution = (lidar2_hbeams, lidar2_vbeams)
         # start and target 
         with torch.device(self.device):
             # self.start_pos = torch.zeros(self.num_envs, 1, 3)
@@ -114,12 +145,12 @@ class NavigationEnv(IsaacEnv):
                 }
                 for env_id in range(self.num_envs)
             }
-            # # 图像保存设置
-            # self.frame_count = 0
-            # self.save_images = True  # 设置为True来启用图像保存
-            # self.image_save_dir = "camera_frames"
-            # if self.save_images and not os.path.exists(self.image_save_dir):
-            #     os.makedirs(self.image_save_dir)
+            # 图像保存设置
+            self.frame_count = 0
+            self.save_images = True  # 设置为True来启用图像保存
+            self.image_save_dir = "camera_frames"
+            if self.save_images and not os.path.exists(self.image_save_dir):
+                os.makedirs(self.image_save_dir)
             self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             self.target_pos[:, 0, 1] = 24.
             self.target_pos[:, 0, 2] = 2.     
@@ -132,17 +163,27 @@ class NavigationEnv(IsaacEnv):
         self.drone = drone_model(cfg=cfg)
         # drone_prim = self.drone.spawn(translations=[(0.0, 0.0, 1.0)])[0]
         drone_prim = self.drone.spawn(translations=[(0.0, 0.0, 2.0)])[0]
+        for env_idx in range(self.num_envs):
+            lidar2_prim_path = f"/World/envs/env_{env_idx}/Hummingbird_0/base_link/lidar2"
+            prim_utils.create_prim(
+                prim_path=lidar2_prim_path,
+                # prim_type="Camera",
+                prim_type="Xform",  # 或 "Sensor"，视你的需求
+                translation=(0.0, 0.0, 0.0),
+                orientation=[0.0, 0.0, 0.0, 0.0]  # 绕y轴-90度，正对无人机x+方向
+                # orientation=[0.5, 0.5, -0.5, -0.5]
+            )
         # ===== 创建摄像头 prim =====
         # 将相机创建在环境级别，而不是机体下面，这样可以避免机体旋转的影响
-        for env_idx in range(self.num_envs):
-            camera_prim_path = f"/World/envs/env_{env_idx}/Camera0"
-            prim_utils.create_prim(
-                prim_path=camera_prim_path,
-                prim_type="Camera",
-                translation=(0.0, 0.0, 2.0),
-                orientation=[0.0, 0.0, 0.7071, 0.7071]
-            )
-        camera_prim_path1 = "/World/envs/env_0/Hummingbird_0/base_link/Camera1"  # 改为环境级别
+        # for env_idx in range(self.num_envs):
+        #     camera_prim_path = f"/World/envs/env_{env_idx}/Camera0"
+        #     prim_utils.create_prim(
+        #         prim_path=camera_prim_path,
+        #         prim_type="Camera",
+        #         translation=(0.0, 0.0, 2.0),
+        #         orientation=[0.0, 0.0, 0.7071, 0.7071]
+        #     )
+        # camera_prim_path1 = "/World/envs/env_0/Hummingbird_0/base_link/Camera1"  # 改为环境级别
         # camera_prim_path0 = "/World/envs/env_0/Camera0"  # 改为环境级别
         # camera_prim0 = prim_utils.create_prim(
         #     prim_path=camera_prim_path0,
@@ -150,12 +191,12 @@ class NavigationEnv(IsaacEnv):
         #     translation=(0.0, 0.0, 2.0),  # 初始位置与无人机相同
         #     orientation=[0.0, 0.0, 0.7071, 0.7071]  # 恢复正确基准：天空在上，朝向Y+飞行方向
         # )
-        camera_prim1 = prim_utils.create_prim(
-            prim_path=camera_prim_path1,
-            prim_type="Camera",
-            translation=(0.0, 0.0, 0.0),  # 初始位置与无人机相同
-            orientation=[0.5, 0.5, -0.5, -0.5]  # 恢复正确基准：天空在上，朝向Y+飞行方向
-        )
+        # camera_prim1 = prim_utils.create_prim(
+        #     prim_path=camera_prim_path1,
+        #     prim_type="Camera",
+        #     translation=(0.0, 0.0, 0.0),  # 初始位置与无人机相同
+        #     orientation=[0.5, 0.5, -0.5, -0.5]  # 恢复正确基准：天空在上，朝向Y+飞行方向
+        # )
         # print(f"[Scene] Created camera at {camera_prim_path0}")
 
         # lighting
@@ -510,39 +551,14 @@ class NavigationEnv(IsaacEnv):
         if (self.cfg.env_dyn.num_obstacles != 0):
             self.move_dynamic_obstacle()
         self.lidar.update(self.dt)
-
-        # 更新相机位置和朝向：跟随无人机的位置和朝向
-        self.update_camera_pose()
-        # self.update_camera1_pose()
-            # === 打印Camera0和无人机的yaw ===
-        # env_idx = 0  # 只对第一个环境做对比，如需全部遍历可加循环
-        # # 1. 获取Camera0四元数
-        # camera0_pos, camera0_quat = self.get_camera0_pose(env_idx)
-        # # 转为欧拉角
-        # camera0_quat_xyzw = np.array([camera0_quat[1], camera0_quat[2], camera0_quat[3], camera0_quat[0]])  # [x, y, z, w]
-        # camera0_euler = R.from_quat(camera0_quat_xyzw).as_euler('xyz')
-        # camera0_yaw = camera0_euler[2]
-
-        # # 2. 获取无人机四元数
-        # drone_quat_xyzw = self.drone.rot[env_idx, 0].unsqueeze(0)
-        # drone_euler = quaternion_to_euler(drone_quat_xyzw)  # [roll, pitch, yaw]
-        # drone_yaw = drone_euler[0, 2].item()
-
-        # print(f"[对比] Camera0 yaw: {camera0_yaw:.3f} rad, Drone yaw: {drone_yaw:.3f} rad, 差值: {abs(camera0_yaw-drone_yaw):.3f} rad")
-
-        # camera0_pos, camera0_quat = self.get_camera0_pose()
-        # print(f"Camera0 Position: {camera0_pos}, Quaternion: {camera0_quat}")
-        self.camera_images = self.camera_sensor.get_images()["distance_to_camera"] # 获取摄像头图像
-        
-        # # 保存第一个环境的摄像头图像用于调试
-        # if self.save_images and self.frame_count % 100 == 0:  # 每10帧保存一次
-        #     self.save_camera_frame()
-        # self.frame_count += 1
+        self.lidar2.update(self.dt)
+        self.save_camera_frame()
+        self.frame_count += 1
 
     
     def save_camera_frame(self):
         """保存摄像头距离场图像 - 为每个环境保存到不同位置"""
-        if self.camera_images is not None:
+        if self.lidar2_scan is not None:
             # 遍历所有环境，为每个环境保存图像
             for env_idx in range(min(10, self.num_envs)):  # 只保存前4个环境的图像
                 # 创建每个环境的专用文件夹
@@ -551,7 +567,7 @@ class NavigationEnv(IsaacEnv):
                     os.makedirs(env_dir)
                 
                 # 获取当前环境的图像数据
-                img_data = self.camera_images[env_idx].cpu().numpy()  # 形状可能是 [H, W] 或 [C, H, W]
+                img_data = self.lidar2_scan[env_idx].cpu().numpy()  # 形状可能是 [H, W] 或 [C, H, W]
                 
                 # 处理图像维度 - 确保是2D图像
                 if len(img_data.shape) == 3:  # [C, H, W]
@@ -601,106 +617,11 @@ class NavigationEnv(IsaacEnv):
                     continue
 
             if self.frame_count % 10 == 0:  # 每10帧打印一次信息
-                img_sample = self.camera_images[0].cpu().numpy()
+                img_sample = self.lidar2_scan[0].cpu().numpy()
                 if len(img_sample.shape) == 3 and img_sample.shape[0] == 1:
                     img_sample = img_sample[0]
                 print(f"保存图像帧 {self.frame_count}, 图像形状: {img_sample.shape}, 距离场范围: [{img_sample.min():.2f}, {img_sample.max():.2f}]")
-    # def update_camera_pose(self):
-    #     """更新相机位置和朝向：让相机始终与无人机机头方向一致"""
-    #     try:
-    #         for env_idx in range(self.num_envs):
-    #             camera_prim_path = f"/World/envs/env_{env_idx}/Camera0"
-    #             camera_prim = prim_utils.get_prim_at_path(camera_prim_path)
-    #             if camera_prim is None:
-    #                 continue
 
-    #             # 获取无人机位置
-    #             drone_pos_xyz = self.drone.pos[env_idx, 0].cpu().numpy().astype(np.float64)
-    #             # 获取无人机四元数
-    #             drone_quat_xyzw = self.drone.rot[env_idx, 0]
-    #             # 机头方向（世界系，x轴）
-    #             front_direction = quat_axis(drone_quat_xyzw.unsqueeze(0), axis=0).squeeze(0).cpu().numpy()
-    #             front_direction = front_direction / np.linalg.norm(front_direction)
-    #             # USD Camera本地 -Z 轴为前方，所以让 -Z 对准机头
-    #             z_axis = -front_direction
-    #             up = np.array([0, 0, 1], dtype=np.float32)
-    #             x_axis = np.cross(up, z_axis)
-    #             x_axis /= np.linalg.norm(x_axis)
-    #             y_axis = np.cross(z_axis, x_axis)
-    #             y_axis /= np.linalg.norm(y_axis)
-    #             rot_mat = np.stack([x_axis, y_axis, z_axis], axis=1)
-    #             quat = R.from_matrix(rot_mat).as_quat()  # [x, y, z, w]
-    #             quat_wxyz = np.roll(quat, 1)  # [w, x, y, z]
-
-    #             # 设置相机位置和朝向
-    #             camera_prim.GetAttribute("xformOp:translate").Set(tuple(drone_pos_xyz.tolist()))
-    #             camera_prim.GetAttribute("xformOp:orient").Set(Gf.Quatd(*quat_wxyz))
-    #     except Exception as e:
-    #         if hasattr(self, '_camera_update_error_count'):
-    #             self._camera_update_error_count += 1
-    #         else:
-    #             self._camera_update_error_count = 1
-    #         if self._camera_update_error_count <= 5:
-    #             print(f"警告: 更新相机姿态失败 ({self._camera_update_error_count}/5): {e}")
-    # def update_camera1_pose(self):
-    #     """
-    #     让 base_link 下的 Camera1 只跟随 yaw，不跟随 pitch/roll。
-    #     原理：
-    #     1. Camera1 会自动继承 base_link 的所有旋转
-    #     2. 需要用 base_link 四元数的逆消除所有旋转
-    #     3. 考虑 env 与 base_link 的坐标系误差
-    #     4. 加回只含 yaw 的旋转
-    #     5. 乘以基础 orientation 对齐相机坐标系
-    #     """
-    #     try:
-    #         # Camera0 基础 orientation（世界坐标系 -> Camera0 局部）
-    #         Q_env_cam0 = Gf.Quatd(0.0, 0.0, 0.7071, 0.7071)
-    #         # Camera1 基础 orientation（base_link -> Camera1 局部）
-    #         Q_baselink_cam1 = Gf.Quatd(0.5, 0.5, -0.5, -0.5)
-    #         # env 与 base_link 的坐标系误差
-    #         Q_env_baselink = Q_env_cam0 * Q_baselink_cam1.GetInverse()
-
-    #         for env_idx in range(self.num_envs):
-    #             camera_prim_path = f"/World/envs/env_{env_idx}/Hummingbird_0/base_link/Camera1"
-    #             camera_prim = prim_utils.get_prim_at_path(camera_prim_path)
-    #             if camera_prim is None:
-    #                 continue
-
-    #             # 获取 base_link 的四元数 [x, y, z, w]
-    #             drone_quat_xyzw = self.drone.rot[env_idx, 0].cpu().numpy().astype(np.float64)
-    #             # 转为 [w, x, y, z] 用于 Gf.Quatd
-    #             drone_quat_wxyz = np.roll(drone_quat_xyzw, 1)
-    #             drone_quat_gf = Gf.Quatd(
-    #                 float(drone_quat_wxyz[0]), 
-    #                 float(drone_quat_wxyz[1]), 
-    #                 float(drone_quat_wxyz[2]), 
-    #                 float(drone_quat_wxyz[3])
-    #             )
-
-    #             # 提取 yaw（世界坐标系下）
-    #             drone_euler = quaternion_to_euler(torch.tensor(drone_quat_xyzw).unsqueeze(0))[0]
-    #             yaw = float(drone_euler[2].item())
-
-    #             # 只含 yaw 的四元数（世界 Z 轴）
-    #             q_yaw = R.from_euler('z', yaw).as_quat()  # [x, y, z, w]
-    #             q_yaw_wxyz = np.roll(q_yaw, 1)  # [w, x, y, z]
-    #             q_yaw_gf = Gf.Quatd(
-    #                 float(q_yaw_wxyz[0]), 
-    #                 float(q_yaw_wxyz[1]), 
-    #                 float(q_yaw_wxyz[2]), 
-    #                 float(q_yaw_wxyz[3])
-    #             )
-
-    #             # 将只含 yaw 的四元数从世界系变换到 base_link 局部系
-    #             q_yaw_baselink = Q_env_baselink.GetInverse() * q_yaw_gf * Q_env_baselink
-
-    #             # Camera1 最终朝向 = base_link 四元数逆 * yaw（base_link 局部系）* 基础 orientation
-    #             final_camera_quat = drone_quat_gf.GetInverse() * q_yaw_baselink * Q_baselink_cam1
-
-    #             camera_prim.GetAttribute("xformOp:orient").Set(final_camera_quat)
-
-    #     except Exception as e:
-    #         print(f"Camera1 姿态更新失败: {e}")
     def update_camera_pose(self):
         """只用yaw，适配多环境，正确处理局部坐标系"""
         try:
@@ -769,93 +690,6 @@ class NavigationEnv(IsaacEnv):
         pos_np = np.array(pos)
         quat_np = np.array([quat.GetReal(), quat.GetImaginary()[0], quat.GetImaginary()[1], quat.GetImaginary()[2]])
         return pos_np, quat_np
-    # def update_camera_pose(self):
-    #     """更新相机位置和朝向：跟随无人机的位置和朝向"""
-    #     try:
-    #         # 为每个环境的主相机设置位置
-    #         for env_idx in range(self.num_envs):
-    #             camera_prim_path = f"/World/envs/env_{env_idx}/Camera0"  # 更新路径
-                
-    #             # 获取相机prim和无人机位置
-    #             camera_prim = prim_utils.get_prim_at_path(camera_prim_path)
-    #             if camera_prim is None:
-    #                 continue
-    #             # drone_pos_xyz = self.get_base_link_world_pose(env_idx=env_idx)[0]
-    #             # 获取无人机的位置和偏航角
-    #             drone_pos_xyz = self.drone.pos[env_idx, 0].cpu().numpy().astype(np.float64)
-    #             # print(f"环境 {env_idx} 无人机位置: {drone_pos_xyz1}")   
-    #             # 获取无人机的四元数并转换为欧拉角
-    #             drone_quat_xyzw = self.drone.rot[env_idx, 0].unsqueeze(0)  # 保持tensor格式用于转换
-                
-    #             # 机头方向（世界系）
-    #             front_direction = quat_axis(torch.tensor(drone_quat_xyzw).unsqueeze(0), axis=0).squeeze(0).cpu().numpy()
-    #             front_direction = front_direction.reshape(3,)  # 保证是一维向量
-    #             z_axis = -front_direction
-    #             # 定义向上方向
-    #             up = np.array([0, 0, 1], dtype=np.float32)
-
-    #             # 构造旋转矩阵（摄像机z轴为up，y轴为前方）
-    #             x_axis = np.cross(up, z_axis)
-    #             x_axis /= np.linalg.norm(x_axis)
-    #             y_axis = np.cross(z_axis, x_axis)
-    #             y_axis /= np.linalg.norm(y_axis)
-    #             rot_mat = np.stack([x_axis, y_axis, z_axis], axis=1)
-
-    #             # 转为四元数（wxyz）
-    #             quat = R.from_matrix(rot_mat).as_quat()  # [x, y, z, w]
-    #             quat_wxyz = np.roll(quat, 1)  # [w, x, y, z]
-    #             # drone_euler = quaternion_to_euler(drone_quat_xyzw)  # 转换为欧拉角 [roll, pitch, yaw]
-    #             # drone_yaw = drone_euler[0, 2].cpu().numpy() # 获取yaw角
-    #                         # 只绕Z轴旋转（yaw），基础朝向为X+（机头方向）
-    #             # camera_quat = Gf.Quatd(math.cos(drone_yaw/2.0), 0.0, 0.0, math.sin(drone_yaw/2.0))
-
-    #             # # 基础相机朝向 (wxyz格式): 朝向Y+方向 - 不要修改这个
-    #             # # base_camera_quat = Gf.Quatd(0.0, 0.0, 0.7071, 0.7071)  # [w, x, y, z] - 正确的基础朝向
-    #             # base_camera_quat =  Gf.Quatd(1.0, 0.0, 0.0, 0.0) 
-    #             # # 创建yaw旋转四元数 (绕Z轴旋转)
-    #             # yaw_rotation = Gf.Quatd(math.cos(drone_yaw/2.0), 0.0, 0.0, math.sin(drone_yaw/2.0))
-                
-    #             # # 组合旋转：先应用基础朝向，再应用yaw旋转
-    #             # final_camera_quat = base_camera_quat * yaw_rotation
-    #             # final_camera_quat = yaw_rotation * base_camera_quat
-    #             # 确保position和orientation属性存在
-    #             translate_attr = camera_prim.GetAttribute("xformOp:translate")
-    #             if not translate_attr:
-    #                 camera_prim.CreateAttribute("xformOp:translate", Sdf.ValueTypeNames.Double3)
-                
-    #             orient_attr = camera_prim.GetAttribute("xformOp:orient")
-    #             if not orient_attr:
-    #                 camera_prim.CreateAttribute("xformOp:orient", Sdf.ValueTypeNames.Quatd)  # 使用双精度四元数
-
-    #             # 更新xformOpOrder确保包含translate和orient
-    #             xform_op_order_attr = camera_prim.GetAttribute("xformOpOrder")
-    #             if not xform_op_order_attr:
-    #                 camera_prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray)
-    #                 camera_prim.GetAttribute("xformOpOrder").Set(["xformOp:translate", "xformOp:orient"])
-    #             else:
-    #                 current_order = list(camera_prim.GetAttribute("xformOpOrder").Get())
-    #                 if "xformOp:translate" not in current_order:
-    #                     current_order.insert(0, "xformOp:translate")
-    #                 if "xformOp:orient" not in current_order:
-    #                     current_order.append("xformOp:orient")
-    #                 camera_prim.GetAttribute("xformOpOrder").Set(current_order)
-                
-    #             # 更新位置和朝向
-    #             camera_prim.GetAttribute("xformOp:translate").Set(tuple(drone_pos_xyz.tolist()))
-                
-    #             # 设置组合后的相机朝向
-    #             camera_prim.GetAttribute("xformOp:orient").Set(Gf.Quatd(*quat_wxyz))
-            
-    #     except Exception as e:
-    #         # 如果出错，打印警告但不中断仿真
-    #         if hasattr(self, '_camera_update_error_count'):
-    #             self._camera_update_error_count += 1
-    #         else:
-    #             self._camera_update_error_count = 1
-                
-    #         # 只在前几次错误时打印，避免大量重复输出
-    #         if self._camera_update_error_count <= 5:
-    #             print(f"警告: 更新相机姿态失败 ({self._camera_update_error_count}/5): {e}")
 
     # get current states/observation
     def _compute_state_and_obs(self):
@@ -870,7 +704,8 @@ class NavigationEnv(IsaacEnv):
             .clamp_max(self.lidar_range)
             .reshape(self.num_envs, 1, *self.lidar_resolution)
         ) # lidar scan store the data that is range - distance and it is in lidar's local frame
-
+        # 新增 lidar2_scan
+        self.lidar2_scan = self.lidar2.data.output["distance_to_image_plane"].unsqueeze(1)  # shape: (num_envs, 1, H, W )
         # Optional render for LiDAR and velocity visualization
         if self._should_render(0):
             self.debug_draw.clear()
@@ -952,20 +787,20 @@ class NavigationEnv(IsaacEnv):
                 color=(1.0, 0.0, 0.0, 1.0),  # 红色
                 # thickness=2.0
                     )
-            # 获取Camera0的位置和四元数
-            camera0_pos, camera0_quat = self.get_camera0_pose(env_idx=0)
-            # Camera0四元数 [w, x, y, z] -> [x, y, z, w] for scipy
-            camera0_quat_xyzw = np.array([camera0_quat[1], camera0_quat[2], camera0_quat[3], camera0_quat[0]])
-            camera0_rot = R.from_quat(camera0_quat_xyzw)
-            camera0_forward = camera0_rot.apply([0, 0, -1])  # 用-Z方向
-            camera0_forward = camera0_forward / np.linalg.norm(camera0_forward)
-            camera0_forward_end = camera0_pos + camera0_forward * 2.0
+            # # 获取Camera0的位置和四元数
+            # camera0_pos, camera0_quat = self.get_camera0_pose(env_idx=0)
+            # # Camera0四元数 [w, x, y, z] -> [x, y, z, w] for scipy
+            # camera0_quat_xyzw = np.array([camera0_quat[1], camera0_quat[2], camera0_quat[3], camera0_quat[0]])
+            # camera0_rot = R.from_quat(camera0_quat_xyzw)
+            # camera0_forward = camera0_rot.apply([0, 0, -1])  # 用-Z方向
+            # camera0_forward = camera0_forward / np.linalg.norm(camera0_forward)
+            # camera0_forward_end = camera0_pos + camera0_forward * 2.0
 
-            self.debug_draw.vector(
-                torch.tensor(camera0_pos).unsqueeze(0),
-                torch.tensor(camera0_forward_end - camera0_pos).unsqueeze(0),
-                color=(0.0, 1.0, 1.0, 1.0),
-            )
+            # self.debug_draw.vector(
+            #     torch.tensor(camera0_pos).unsqueeze(0),
+            #     torch.tensor(camera0_forward_end - camera0_pos).unsqueeze(0),
+            #     color=(0.0, 1.0, 1.0, 1.0),
+            # )
 
         # ---------Network Input II: Drone's internal states---------
         # a. distance info in horizontal and vertical plane
@@ -1054,7 +889,7 @@ class NavigationEnv(IsaacEnv):
             "lidar": self.lidar_scan,
             "direction": target_dir_2d,
             "dynamic_obstacle": dyn_obs_states,
-            "camera": self.camera_images if self.camera_images is not None else torch.zeros(self.num_envs, 1, 224, 224, device=self.device)
+            "camera": self.lidar2_scan if self.lidar2_scan is not None else torch.zeros(self.num_envs, 1, 224, 224, device=self.device)
         }
 
         # -----------------Reward Calculation-----------------
