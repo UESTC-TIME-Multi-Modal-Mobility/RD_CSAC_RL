@@ -2,7 +2,7 @@
 Author: zdytim zdytim@foxmail.com
 Date: 2026-01-14 23:20:20
 LastEditors: zdytim zdytim@foxmail.com
-LastEditTime: 2026-01-20 22:49:16
+LastEditTime: 2026-01-21 00:07:58
 FilePath: /NavRL/isaac-training/training/scripts/RevKDTrainRL.py
 Description: RL-based Knowledge Distillation using Teacher's Critic to guide Student Actor
 '''
@@ -312,13 +312,15 @@ def main(cfg):
                     "train/warmup_progress": len(replay_buffer) / warmup_steps
                 })
             
-            # Episode statistics
             episode_stats.add(data)
-            # if len(episode_stats) >= transformed_env.num_envs:
-            stats = {
-                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
-                for k, v in episode_stats.pop().items(True, True)
-            }
+            if len(episode_stats) > 0:
+                popped = episode_stats.pop()
+                stats = {
+                    "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
+                    for k, v in popped.items(True, True)
+                }
+            else:
+                stats = {}
             info.update(stats)
 
             # Evaluation using student policy
