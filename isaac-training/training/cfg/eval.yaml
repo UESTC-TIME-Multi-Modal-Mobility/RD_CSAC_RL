@@ -22,14 +22,14 @@ collector:
   reset_at_each_iter: False
 # Training Environment
 env:
-  num_envs: 8 # Number of drones for training
-  max_episode_length: 3000
+  num_envs: 256 # Number of drones for training
+  max_episode_length: 2200
   env_spacing: 8.0
   num_obstacles: 100
   max_episode_steps: 1000
 
 env_dyn:
-  num_obstacles: 30 # set to zero if static env is needed
+  num_obstacles: 50 # set to zero if static env is needed
   vel_range: [0.5, 1.5]
   local_range: [5.0, 5.0, 4.5]
 

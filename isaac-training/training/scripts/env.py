@@ -16,6 +16,8 @@ from omni.isaac.orbit.sensors.ray_caster.ray_caster_camera_cfg import RayCasterC
 from utils import vec_to_new_frame, vec_to_world, construct_input
 import omni.isaac.core.utils.prims as prim_utils
 from pxr import Sdf, Gf
+from pxr import Sdf, Gf, UsdPhysics, Usd  # 新增 UsdPhysics 和 Usd
+import omni.usd  # 新增此行，用于更可靠地获取 Stage
 import omni.isaac.orbit.sim as sim_utils
 import omni.isaac.orbit.utils.math as math_utils
 from omni_drones.sensors.camera import Camera, PinholeCameraCfg
@@ -109,8 +111,9 @@ class NavigationEnv(IsaacEnv):
             prim_path="/World/envs/env_.*/Hummingbird_0/base_link/lidar2",
             offset=RayCasterCameraCfg.OffsetCfg(
                 pos=(0.0, 0.0, 0.0),
-                rot=(0.0, 0.0, 1.0, 0.0)，
-                # rot=(0.7071, 0.0, 0.7071, 0.0),
+                # rot=(0.0, 0.0, 1.0, 0.0),
+                # rot=(0.5, -0.5, -0.5, -0.5),
+                rot=(0.7071, 0.0, 0.7071, 0.0),
                 # rot=(0.5, 0.5, -0.5, -0.5),  # 绕y轴-90度，正对无人机x+方向
                 convention="ros"
             ),
@@ -123,7 +126,7 @@ class NavigationEnv(IsaacEnv):
             ),
             mesh_prim_paths=["/World/ground"],
             data_types=["distance_to_image_plane"],
-            debug_vis=True,
+            debug_vis=False,
         )
         self.lidar2 = RayCasterCamera(lidar2_cfg)
         self.lidar2._initialize_impl()
@@ -146,14 +149,14 @@ class NavigationEnv(IsaacEnv):
                 for env_id in range(self.num_envs)
             }
             # 图像保存设置
-            self.frame_count = 0
-            self.save_images = True  # 设置为True来启用图像保存
-            self.image_save_dir = "camera_frames"
-            if self.save_images and not os.path.exists(self.image_save_dir):
-                os.makedirs(self.image_save_dir)
-            self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
-            self.target_pos[:, 0, 1] = 24.
-            self.target_pos[:, 0, 2] = 2.     
+            # self.frame_count = 0
+            # self.save_images = True  # 设置为True来启用图像保存
+            # self.image_save_dir = "camera_frames"
+            # if self.save_images and not os.path.exists(self.image_save_dir):
+            #     os.makedirs(self.image_save_dir)
+            # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
+            # self.target_pos[:, 0, 1] = 24.
+            # self.target_pos[:, 0, 2] = 2.     
 
 
     def _design_scene(self):
@@ -472,7 +475,7 @@ class NavigationEnv(IsaacEnv):
 
     
     def reset_target(self, env_ids: torch.Tensor):
-        if (self.training ==True):
+        if (self.training == 5):
             # decide which side
             masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
             shifts = torch.tensor([[0., 24., 0.], [0., -24., 0.], [24., 0., 0.], [-24., 0., 0.]], dtype=torch.float, device=self.device)
@@ -502,7 +505,7 @@ class NavigationEnv(IsaacEnv):
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
         self.reset_target(env_ids)
-        if (self.training == True):
+        if (self.training == 5 ):
             masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
             shifts = torch.tensor([[0., 24., 0.], [0., -24., 0.], [24., 0., 0.], [-24., 0., 0.]], dtype=torch.float, device=self.device)
             mask_indices = np.random.randint(0, masks.size(0), size=env_ids.size(0))
@@ -552,8 +555,8 @@ class NavigationEnv(IsaacEnv):
             self.move_dynamic_obstacle()
         self.lidar.update(self.dt)
         self.lidar2.update(self.dt)
-        self.save_camera_frame()
-        self.frame_count += 1
+        # self.save_camera_frame()
+        # self.frame_count += 1
 
     
     def save_camera_frame(self):
@@ -704,8 +707,7 @@ class NavigationEnv(IsaacEnv):
             .clamp_max(self.lidar_range)
             .reshape(self.num_envs, 1, *self.lidar_resolution)
         ) # lidar scan store the data that is range - distance and it is in lidar's local frame
-        # 新增 lidar2_scan
-        self.lidar2_scan = self.lidar2.data.output["distance_to_image_plane"].unsqueeze(1)  # shape: (num_envs, 1, H, W )
+        self.lidar2_scan = torch.flip(self.lidar2.data.output["distance_to_image_plane"], dims=[-2]).transpose(-2, -1).unsqueeze(1)
         # Optional render for LiDAR and velocity visualization
         if self._should_render(0):
             self.debug_draw.clear()

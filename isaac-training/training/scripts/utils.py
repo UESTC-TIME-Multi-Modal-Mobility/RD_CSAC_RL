@@ -205,14 +205,14 @@ def evaluate(
     env.eval()
     env.set_seed(seed)
 
-    # 禁用视频录制以节省显存
     render_callback = RenderCallback(interval=2)
     
     with set_exploration_type(exploration_type):
         trajs = env.rollout(
             max_steps=env.max_episode_length,
             policy=policy,
-            callback=render_callback,  # 禁用视频录制
+            callback=render_callback, 
+            # callback=None,# 禁用视频录制
             auto_reset=True,
             break_when_any_done=False,
             return_contiguous=False,
@@ -249,7 +249,120 @@ def evaluate(
     # env.reset()
 
     return info
+# @torch.no_grad()
+# def evaluate(
+#     env,
+#     policy,
+#     cfg,
+#     seed: int=0, 
+#     exploration_type: ExplorationType=ExplorationType.MEAN
+# ):
+#     print(f"\n[NavRL Eval]: 🟢 Starting Memory-Efficient Evaluation (Seed {seed})...")
+    
+#     # 1. 强制 Train 模式 (开启并行物理)
+#     env.enable_render(False) # 彻底关闭渲染接口
+#     env.train()  
+    
+#     # 2. 策略设为 Eval (确定性)
+#     if hasattr(policy, "eval"):
+#         policy.eval()
 
+#     env.set_seed(seed)
+    
+#     # 3. 重置环境，获取初始观测
+#     print("[NavRL Eval]: Resetting environment...")
+#     tensordict = env.reset()
+    
+#     # 4. 初始化统计容器
+#     # 我们只记录每个环境"第一次"完成任务时的数据，避免重复统计
+#     finished_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+#     final_stats = {} 
+    
+#     # 5. 手动循环 (替代 env.rollout)
+#     # 这样我们可以控制每一步都不保存历史图像，只保存统计数据
+#     max_steps = 12000 # 只要时间够长，就能飞完
+#     print(f"[NavRL Eval]: Running loop for {max_steps} steps (Discarding history)...")
+    
+#     import time
+#     start_time = time.time()
+    
+#     for step in range(max_steps):
+#         # A. 策略推理 (不保存梯度)
+#         with set_exploration_type(exploration_type):
+#             tensordict = policy(tensordict)
+        
+#         # B. 环境步进
+#         tensordict = env.step(tensordict)
+        
+#         # C. 提取 Next State
+#         tensordict = tensordict["next"]
+        
+#         # D. 实时统计 (关键步骤)
+#         # 获取 done 信号 (terminated 或 truncated)
+#         done = tensordict["done"].squeeze(-1) # [Num_Envs]
+        
+#         # 如果有环境刚刚完成 (done=True) 且之前没完成过
+#         newly_finished = done & (~finished_mask)
+        
+#         if newly_finished.any():
+#             # 提取这些环境的统计数据 (stats 存在于 tensordict 中)
+#             # 注意：env.py 在 reset 时会清空 stats，所以要在 done 的这一帧抓取
+#             current_stats = tensordict["stats"] # [Num_Envs, Stats_Dim]或其他结构
+            
+#             # 初始化 final_stats (如果是第一次)
+#             if not final_stats:
+#                 for k in current_stats.keys():
+#                     # 预分配空间，避免碎片
+#                     final_stats[k] = torch.zeros(env.num_envs, device=env.device)
+            
+#             # 记录数据
+#             indices = newly_finished.nonzero().squeeze(-1)
+#             for k, v in current_stats.items():
+#                 # v 可能是 [Num_Envs, 1] 或 [Num_Envs]
+#                 val = v[indices]
+#                 if val.dim() > 1: val = val.squeeze(-1)
+#                 final_stats[k][indices] = val
+            
+#             # 更新掩码
+#             finished_mask = finished_mask | newly_finished
+            
+#             # 打印进度 (每完成 10% 打印一次)
+#             completed_count = finished_mask.sum().item()
+#             if step % 100 == 0:
+#                  print(f"\r[Eval Progress]: Step {step}/{max_steps} | Completed: {completed_count}/{env.num_envs}", end="")
+
+#         # E. 极其重要：处理 Auto-Reset
+#         # IsaacEnv 通常会自动 reset，但我们需要确保 tensordict 里的 observation 是最新的
+#         # 如果 env.step 内部处理了 reset，tensordict["next"] 已经是 reset 后的状态了
+#         # 我们不需要手动 reset，只需要把 done 的环境标记一下即可
+        
+#         # F. 提前退出机制
+#         if finished_mask.all():
+#             print(f"\n[NavRL Eval]: All {env.num_envs} environments finished at step {step}!")
+#             break
+            
+#     print(f"\n[NavRL Eval]: Loop finished. Duration: {time.time() - start_time:.2f}s")
+    
+#     # 6. 计算最终平均值
+#     # 注意：只统计那些实际完成了的环境 (finished_mask)
+#     # 如果没跑完 (例如 crash 了或者时间不够)，就只算跑完的
+#     num_finished = finished_mask.sum().item()
+#     if num_finished == 0:
+#         print("[NavRL Eval]: ⚠️ WARNING: No environments finished! Check max_steps or difficulty.")
+#         return {}
+
+#     info = {}
+#     for k, v in final_stats.items():
+#         # 只取 finished 的部分求平均
+#         valid_values = v[finished_mask]
+#         info["eval/stats." + k] = torch.mean(valid_values.float()).item()
+
+#     # 恢复 Policy 状态
+#     if hasattr(policy, "train"):
+#         policy.train()
+
+#     print(f"[NavRL Eval]: Stats collected: {info}")
+#     return info
 
 def vec_to_new_frame(vec, goal_direction):
     if (len(vec.size()) == 1):

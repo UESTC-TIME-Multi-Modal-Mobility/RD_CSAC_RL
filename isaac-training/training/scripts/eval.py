@@ -102,7 +102,7 @@ def main(cfg):
             "env_seed": eval_seed,
             "checkpoint": ckpt_name,
         }
-        env.enable_render(True)
+        # env.enable_render(True)
         env.eval()
         transformed_env.set_seed(eval_seed)
         eval_info = evaluate(

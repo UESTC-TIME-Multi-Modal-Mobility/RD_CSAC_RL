@@ -2,7 +2,7 @@
 Author: zdytim zdytim@foxmail.com
 Date: 2026-01-14 23:20:20
 LastEditors: zdytim zdytim@foxmail.com
-LastEditTime: 2026-01-15 00:05:06
+LastEditTime: 2026-01-20 22:49:16
 FilePath: /NavRL/isaac-training/training/scripts/RevKDTrainRL.py
 Description: RL-based Knowledge Distillation using Teacher's Critic to guide Student Actor
 '''
@@ -197,8 +197,8 @@ def main(cfg):
     )
 
     # RL-based Knowledge distillation parameters
-    kd_alpha = cfg.get('kd_alpha', 0.8)       # RL损失权重
-    bc_weight = cfg.get('bc_weight', 0.2)     # 行为克隆损失权重
+    kd_alpha = cfg.get('kd_alpha', 0.9)       # RL损失权重
+    bc_weight = cfg.get('bc_weight', 0.1)     # 行为克隆损失权重
     update_counter = 0
     warmup_steps = cfg.algo.warmup_steps
     
@@ -261,7 +261,7 @@ def main(cfg):
                     # Student parameter update
                     policy_s.optimizer.zero_grad()
                     kd_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy_s.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(policy_s.parameters(), max_norm=5.0)
                     policy_s.optimizer.step()
                     
                     # 收集统计信息
@@ -314,15 +314,15 @@ def main(cfg):
             
             # Episode statistics
             episode_stats.add(data)
-            if len(episode_stats) >= transformed_env.num_envs:
-                stats = {
-                    "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
-                    for k, v in episode_stats.pop().items(True, True)
-                }
-                info.update(stats)
+            # if len(episode_stats) >= transformed_env.num_envs:
+            stats = {
+                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
+                for k, v in episode_stats.pop().items(True, True)
+            }
+            info.update(stats)
 
             # Evaluation using student policy
-            if i % cfg.eval_interval == 0 and i > 0:
+            if i % cfg.eval_interval == 0 and i >= 0:
                 torch.cuda.empty_cache()
                 print(f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Evaluating student policy at step: {i}")
                 # env.enable_render(True)
@@ -361,7 +361,8 @@ def main(cfg):
                 print(f"Student performance vs Teacher comparison logged")
 
             # Log to wandb
-            run.log(info)
+            print("Wait! Attempting to send log to WandB...", info.keys())
+            run.log(info, step=collector._frames)
             
             # 定期显存清理
             if i % 10 == 0:

@@ -10,11 +10,11 @@ algo:
     learning_rate: 5e-4
   critic_cost:
     learning_rate: 1e-3
-  training_frame_num: 16   #每环境32帧
-  training_epoch_num: 5
+  training_frame_num: 1   #每环境64帧
+  training_epoch_num: 10
   num_minibatches: 16 # split into N minibatches
   buffer_size: 2e5
-  warmup_steps: 300
+  warmup_steps: 500
   lambda_learning_rate: 1e-5
   eval_interval: 1000
   batch_size: 256

@@ -10,7 +10,7 @@ seed: 0
 
 # Total Training Length
 max_frame_num: 12e8 # max frame 
-eval_interval: 70000 # evaluate the policy for every N training steps
+eval_interval: 1000 # evaluate the policy for every N training steps
 save_interval: 1000
 # collector
 collector:
@@ -22,7 +22,7 @@ collector:
   reset_at_each_iter: False
 # Training Environment
 env:
-  num_envs: 8 # Number of drones for training
+  num_envs: 512 # Number of drones for training
   max_episode_length: 2200
   env_spacing: 8.0
   num_obstacles: 100
@@ -46,7 +46,7 @@ wandb:
   mode: online
   run: True
   id: 2
-  key: #836b25ad1ef4b0832c55eb637d418e6d
+  key: 836b25ad1ef4b0832c55eb637d418e6d
   run_id: #kw9xf9k9
 
 # network
@@ -70,17 +70,17 @@ optim:
   adam_eps: 1.0e-8
 
 # replay buffer
-replay_buffer:
-  size: 10000
-  prb: 0 # use prioritized experience replay
-  scratch_dir:
+# replay_buffer:
+#   size: 10000
+#   prb: 0 # use prioritized experience replay
+#   scratch_dir:
 
 compile:
   compile: False
   compile_mode:
   cudagraphs: False
 
-training_frame_num: 32   #每环境64帧
-training_epoch_num: 5
+training_frame_num: 1   #每环境64帧
+training_epoch_num: 10
 num_minibatches: 16 # split into N minibatches
 alpha_learning_rate: 1e-5 # coefficient for learning alpha

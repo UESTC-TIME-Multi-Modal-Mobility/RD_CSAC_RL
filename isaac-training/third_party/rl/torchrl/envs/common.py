@@ -2595,7 +2595,10 @@ class EnvBase(nn.Module, metaclass=_EnvPostInit):
                 tensordict = self.step(tensordict_)
             else:
                 tensordict, tensordict_ = self.step_and_maybe_reset(tensordict_)
-            tensordicts.append(tensordict)
+            td_to_save = tensordict.clone(False)
+            del td_to_save["agents"][ "observation" ]["camera"]
+            del td_to_save["next"]["agents"]["observation"]["camera"]
+            tensordicts.append(td_to_save)
             if i == max_steps - 1:
                 # we don't truncated as one could potentially continue the run
                 break
